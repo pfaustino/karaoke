@@ -1,0 +1,17 @@
+[package]
+name = "karaoke-booth"
+version = "0.1.0"
+edition = "2021"
+description = "Low-latency native karaoke voice booth"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+rfd = "0.15"
+rtrb = "0.3"
+symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "ogg", "wav", "pcm"] }
+wasapi = "0.24"
+
+[profile.release]
+lto = true
+codegen-units = 1

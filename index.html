@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Karaoke Booth</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Outfit:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="glow glow-a"></div>
+    <div class="glow glow-b"></div>
+    <main class="app">
+      <header class="mast">
+        <p class="eyebrow">Live voice booth</p>
+        <h1>Karaoke</h1>
+        <p class="lede">Amplify your mic, snap to pitch, then soak it in reverb.</p>
+      </header>
+
+      <section class="stage">
+        <canvas id="viz" width="720" height="220" aria-hidden="true"></canvas>
+        <div class="orb">
+          <span class="orb-note" id="note">—</span>
+          <span class="orb-meta" id="note-meta">waiting</span>
+        </div>
+        <div class="meter" aria-hidden="true"><i id="meter-fill"></i></div>
+        <p class="hint">Use headphones so the speakers do not feed back into the mic.</p>
+        <div class="stage-actions">
+          <button type="button" id="mic-btn" class="mic-btn">Start microphone</button>
+          <p class="status" id="status">Mic is off</p>
+        </div>
+      </section>
+
+      <section class="desk">
+        <article class="panel">
+          <h2>Voice</h2>
+          <label>
+            Amplify
+            <input id="voice-gain" type="range" min="0" max="3" step="0.05" value="1.4" />
+            <span data-readout="voice-gain">1.40</span>
+          </label>
+          <label>
+            Master
+            <input id="master-gain" type="range" min="0" max="1.5" step="0.05" value="0.95" />
+            <span data-readout="master-gain">0.95</span>
+          </label>
+        </article>
+
+        <article class="panel">
+          <h2>Autotune</h2>
+          <label class="toggle">
+            <input id="tune-on" type="checkbox" checked />
+            Enable
+          </label>
+          <label>
+            Amount
+            <input id="tune-amount" type="range" min="0" max="1" step="0.01" value="0.85" />
+            <span data-readout="tune-amount">0.85</span>
+          </label>
+          <label>
+            Snap speed
+            <input id="tune-retune" type="range" min="0.05" max="1" step="0.01" value="0.55" />
+            <span data-readout="tune-retune">0.55</span>
+          </label>
+          <label>
+            Key
+            <select id="tune-key">
+              <option value="0" selected>C</option>
+              <option value="1">C#</option>
+              <option value="2">D</option>
+              <option value="3">D#</option>
+              <option value="4">E</option>
+              <option value="5">F</option>
+              <option value="6">F#</option>
+              <option value="7">G</option>
+              <option value="8">G#</option>
+              <option value="9">A</option>
+              <option value="10">A#</option>
+              <option value="11">B</option>
+            </select>
+          </label>
+          <label>
+            Scale
+            <select id="tune-scale">
+              <option value="chromatic">Chromatic</option>
+              <option value="major" selected>Major</option>
+              <option value="minor">Minor</option>
+            </select>
+          </label>
+        </article>
+
+        <article class="panel">
+          <h2>Space</h2>
+          <label>
+            Reverb
+            <input id="reverb-mix" type="range" min="0" max="1" step="0.01" value="0.33" />
+            <span data-readout="reverb-mix">0.33</span>
+          </label>
+          <label>
+            Room size
+            <input id="reverb-size" type="range" min="0" max="1" step="0.01" value="0.55" />
+            <span data-readout="reverb-size">0.55</span>
+          </label>
+          <label>
+            Echo
+            <input id="echo-mix" type="range" min="0" max="1" step="0.01" value="0.22" />
+            <span data-readout="echo-mix">0.22</span>
+          </label>
+          <label>
+            Echo time
+            <input id="echo-time" type="range" min="0.08" max="0.7" step="0.01" value="0.26" />
+            <span data-readout="echo-time">0.26</span>
+          </label>
+        </article>
+
+        <article class="panel">
+          <h2>Track</h2>
+          <label class="file">
+            Backing track
+            <input id="track-file" type="file" accept="audio/*" />
+          </label>
+          <label>
+            Track level
+            <input id="track-gain" type="range" min="0" max="1.2" step="0.05" value="0.70" />
+            <span data-readout="track-gain">0.70</span>
+          </label>
+          <button type="button" id="track-toggle" class="ghost" disabled>Play / pause</button>
+        </article>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
