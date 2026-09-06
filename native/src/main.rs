@@ -4,23 +4,25 @@ mod dsp;
 mod engine;
 mod fx;
 mod pitch;
+mod settings;
 mod state;
 mod track;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, RichText, Sense, Stroke, Vec2};
 use engine::{list_playback_devices, stereo_mix_device_name, Engine, PlaybackDevice};
 use pitch::{cents_off, NOTE_NAMES};
+use settings::{Autosave, SavedSettings};
 use state::{load_f32, store_f32, Shared};
 use track::Track;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 1180.0])
-            .with_min_inner_size([880.0, 900.0])
+            .with_inner_size([1100.0, 920.0])
+            .with_min_inner_size([880.0, 760.0])
             .with_title("Karaoke Booth"),
         ..Default::default()
     };
@@ -41,41 +43,57 @@ struct BoothApp {
     tune_retune: f32,
     key: i32,
     scale: usize,
+    reverb_on: bool,
     reverb_mix: f32,
     reverb_size: f32,
+    echo_on: bool,
     echo_mix: f32,
     echo_time: f32,
     track_gain: f32,
+    alien_on: bool,
     alien: f32,
     alien_rate: f32,
+    chipmunk_on: bool,
     chipmunk: f32,
     chipmunk_height: f32,
+    demon_on: bool,
     demon: f32,
     demon_depth: f32,
+    robot_on: bool,
     robot: f32,
     robot_crunch: f32,
+    telephone_on: bool,
     telephone: f32,
     telephone_tone: f32,
+    chorus_on: bool,
     chorus: f32,
     chorus_rate: f32,
+    radio_on: bool,
     radio: f32,
     radio_static: f32,
+    vader_on: bool,
     vader: f32,
     vader_dark: f32,
+    flange_on: bool,
     flange: f32,
     flange_rate: f32,
+    phaser_on: bool,
     phaser: f32,
     phaser_rate: f32,
+    vibrato_on: bool,
     vibrato: f32,
     vibrato_rate: f32,
+    overdrive_on: bool,
     overdrive: f32,
     overdrive_drive: f32,
+    underwater_on: bool,
     underwater: f32,
     underwater_depth: f32,
     send_discord: bool,
     discord_device_id: String,
     playback_devices: Vec<PlaybackDevice>,
     stereo_mix_name: Option<String>,
+    autosave: Autosave,
 }
 
 impl BoothApp {
@@ -91,42 +109,62 @@ impl BoothApp {
             tune_retune: 0.55,
             key: 0,
             scale: 1,
+            reverb_on: true,
             reverb_mix: 0.33,
             reverb_size: 0.55,
+            echo_on: true,
             echo_mix: 0.22,
             echo_time: 0.26,
             track_gain: 0.7,
+            alien_on: true,
             alien: 0.0,
             alien_rate: 0.45,
+            chipmunk_on: true,
             chipmunk: 0.0,
             chipmunk_height: 0.7,
+            demon_on: true,
             demon: 0.0,
             demon_depth: 0.7,
+            robot_on: true,
             robot: 0.0,
             robot_crunch: 0.55,
+            telephone_on: true,
             telephone: 0.0,
             telephone_tone: 0.45,
+            chorus_on: true,
             chorus: 0.0,
             chorus_rate: 0.35,
+            radio_on: true,
             radio: 0.0,
             radio_static: 0.3,
+            vader_on: true,
             vader: 0.0,
             vader_dark: 0.7,
+            flange_on: true,
             flange: 0.0,
             flange_rate: 0.35,
+            phaser_on: true,
             phaser: 0.0,
             phaser_rate: 0.4,
+            vibrato_on: true,
             vibrato: 0.0,
             vibrato_rate: 0.45,
+            overdrive_on: true,
             overdrive: 0.0,
             overdrive_drive: 0.55,
+            underwater_on: true,
             underwater: 0.0,
             underwater_depth: 0.6,
             send_discord: false,
             discord_device_id: String::new(),
             playback_devices: Vec::new(),
             stereo_mix_name: None,
+            autosave: Autosave::new(SavedSettings::default()),
         };
+        if let Some(saved) = SavedSettings::load() {
+            app.apply_settings(&saved);
+        }
+        app.autosave = Autosave::new(app.snapshot());
         app.refresh_devices();
         app
     }
@@ -153,36 +191,45 @@ impl BoothApp {
         store_f32(&self.shared.tune_retune, self.tune_retune);
         self.shared.key.store(self.key as u32, Ordering::Relaxed);
         self.shared.scale.store(self.scale as u32, Ordering::Relaxed);
-        store_f32(&self.shared.reverb_mix, self.reverb_mix);
+        store_f32(&self.shared.reverb_mix, gated(self.reverb_on, self.reverb_mix));
         store_f32(&self.shared.reverb_size, self.reverb_size);
-        store_f32(&self.shared.echo_mix, self.echo_mix);
+        store_f32(&self.shared.echo_mix, gated(self.echo_on, self.echo_mix));
         store_f32(&self.shared.echo_time, self.echo_time);
         store_f32(&self.shared.track_gain, self.track_gain);
-        store_f32(&self.shared.alien, self.alien);
+        store_f32(&self.shared.alien, gated(self.alien_on, self.alien));
         store_f32(&self.shared.alien_rate, self.alien_rate);
-        store_f32(&self.shared.chipmunk, self.chipmunk);
+        store_f32(&self.shared.chipmunk, gated(self.chipmunk_on, self.chipmunk));
         store_f32(&self.shared.chipmunk_height, self.chipmunk_height);
-        store_f32(&self.shared.demon, self.demon);
+        store_f32(&self.shared.demon, gated(self.demon_on, self.demon));
         store_f32(&self.shared.demon_depth, self.demon_depth);
-        store_f32(&self.shared.robot, self.robot);
+        store_f32(&self.shared.robot, gated(self.robot_on, self.robot));
         store_f32(&self.shared.robot_crunch, self.robot_crunch);
-        store_f32(&self.shared.telephone, self.telephone);
+        store_f32(
+            &self.shared.telephone,
+            gated(self.telephone_on, self.telephone),
+        );
         store_f32(&self.shared.telephone_tone, self.telephone_tone);
-        store_f32(&self.shared.chorus, self.chorus);
+        store_f32(&self.shared.chorus, gated(self.chorus_on, self.chorus));
         store_f32(&self.shared.chorus_rate, self.chorus_rate);
-        store_f32(&self.shared.radio, self.radio);
+        store_f32(&self.shared.radio, gated(self.radio_on, self.radio));
         store_f32(&self.shared.radio_static, self.radio_static);
-        store_f32(&self.shared.vader, self.vader);
+        store_f32(&self.shared.vader, gated(self.vader_on, self.vader));
         store_f32(&self.shared.vader_dark, self.vader_dark);
-        store_f32(&self.shared.flange, self.flange);
+        store_f32(&self.shared.flange, gated(self.flange_on, self.flange));
         store_f32(&self.shared.flange_rate, self.flange_rate);
-        store_f32(&self.shared.phaser, self.phaser);
+        store_f32(&self.shared.phaser, gated(self.phaser_on, self.phaser));
         store_f32(&self.shared.phaser_rate, self.phaser_rate);
-        store_f32(&self.shared.vibrato, self.vibrato);
+        store_f32(&self.shared.vibrato, gated(self.vibrato_on, self.vibrato));
         store_f32(&self.shared.vibrato_rate, self.vibrato_rate);
-        store_f32(&self.shared.overdrive, self.overdrive);
+        store_f32(
+            &self.shared.overdrive,
+            gated(self.overdrive_on, self.overdrive),
+        );
         store_f32(&self.shared.overdrive_drive, self.overdrive_drive);
-        store_f32(&self.shared.underwater, self.underwater);
+        store_f32(
+            &self.shared.underwater,
+            gated(self.underwater_on, self.underwater),
+        );
         store_f32(&self.shared.underwater_depth, self.underwater_depth);
         self.shared
             .send_discord
@@ -238,6 +285,122 @@ impl BoothApp {
             }
             Err(err) => self.shared.set_status(err),
         }
+    }
+
+    fn snapshot(&self) -> SavedSettings {
+        SavedSettings {
+            voice_gain: self.voice_gain,
+            master_gain: self.master_gain,
+            tune_on: self.tune_on,
+            tune_amount: self.tune_amount,
+            tune_retune: self.tune_retune,
+            key: self.key,
+            scale: self.scale,
+            reverb_on: self.reverb_on,
+            reverb_mix: self.reverb_mix,
+            reverb_size: self.reverb_size,
+            echo_on: self.echo_on,
+            echo_mix: self.echo_mix,
+            echo_time: self.echo_time,
+            track_gain: self.track_gain,
+            send_discord: self.send_discord,
+            alien_on: self.alien_on,
+            alien: self.alien,
+            alien_rate: self.alien_rate,
+            chipmunk_on: self.chipmunk_on,
+            chipmunk: self.chipmunk,
+            chipmunk_height: self.chipmunk_height,
+            demon_on: self.demon_on,
+            demon: self.demon,
+            demon_depth: self.demon_depth,
+            robot_on: self.robot_on,
+            robot: self.robot,
+            robot_crunch: self.robot_crunch,
+            telephone_on: self.telephone_on,
+            telephone: self.telephone,
+            telephone_tone: self.telephone_tone,
+            chorus_on: self.chorus_on,
+            chorus: self.chorus,
+            chorus_rate: self.chorus_rate,
+            radio_on: self.radio_on,
+            radio: self.radio,
+            radio_static: self.radio_static,
+            vader_on: self.vader_on,
+            vader: self.vader,
+            vader_dark: self.vader_dark,
+            flange_on: self.flange_on,
+            flange: self.flange,
+            flange_rate: self.flange_rate,
+            phaser_on: self.phaser_on,
+            phaser: self.phaser,
+            phaser_rate: self.phaser_rate,
+            vibrato_on: self.vibrato_on,
+            vibrato: self.vibrato,
+            vibrato_rate: self.vibrato_rate,
+            overdrive_on: self.overdrive_on,
+            overdrive: self.overdrive,
+            overdrive_drive: self.overdrive_drive,
+            underwater_on: self.underwater_on,
+            underwater: self.underwater,
+            underwater_depth: self.underwater_depth,
+        }
+    }
+
+    fn apply_settings(&mut self, saved: &SavedSettings) {
+        self.voice_gain = saved.voice_gain;
+        self.master_gain = saved.master_gain;
+        self.tune_on = saved.tune_on;
+        self.tune_amount = saved.tune_amount;
+        self.tune_retune = saved.tune_retune;
+        self.key = saved.key.clamp(0, 11);
+        self.scale = saved.scale.min(2);
+        self.reverb_on = saved.reverb_on;
+        self.reverb_mix = saved.reverb_mix;
+        self.reverb_size = saved.reverb_size;
+        self.echo_on = saved.echo_on;
+        self.echo_mix = saved.echo_mix;
+        self.echo_time = saved.echo_time;
+        self.track_gain = saved.track_gain;
+        self.send_discord = saved.send_discord;
+        self.alien_on = saved.alien_on;
+        self.alien = saved.alien;
+        self.alien_rate = saved.alien_rate;
+        self.chipmunk_on = saved.chipmunk_on;
+        self.chipmunk = saved.chipmunk;
+        self.chipmunk_height = saved.chipmunk_height;
+        self.demon_on = saved.demon_on;
+        self.demon = saved.demon;
+        self.demon_depth = saved.demon_depth;
+        self.robot_on = saved.robot_on;
+        self.robot = saved.robot;
+        self.robot_crunch = saved.robot_crunch;
+        self.telephone_on = saved.telephone_on;
+        self.telephone = saved.telephone;
+        self.telephone_tone = saved.telephone_tone;
+        self.chorus_on = saved.chorus_on;
+        self.chorus = saved.chorus;
+        self.chorus_rate = saved.chorus_rate;
+        self.radio_on = saved.radio_on;
+        self.radio = saved.radio;
+        self.radio_static = saved.radio_static;
+        self.vader_on = saved.vader_on;
+        self.vader = saved.vader;
+        self.vader_dark = saved.vader_dark;
+        self.flange_on = saved.flange_on;
+        self.flange = saved.flange;
+        self.flange_rate = saved.flange_rate;
+        self.phaser_on = saved.phaser_on;
+        self.phaser = saved.phaser;
+        self.phaser_rate = saved.phaser_rate;
+        self.vibrato_on = saved.vibrato_on;
+        self.vibrato = saved.vibrato;
+        self.vibrato_rate = saved.vibrato_rate;
+        self.overdrive_on = saved.overdrive_on;
+        self.overdrive = saved.overdrive;
+        self.overdrive_drive = saved.overdrive_drive;
+        self.underwater_on = saved.underwater_on;
+        self.underwater = saved.underwater;
+        self.underwater_depth = saved.underwater_depth;
     }
 }
 
@@ -341,13 +504,17 @@ impl eframe::App for BoothApp {
             ui.add_space(14.0);
             ui.columns(4, |cols| {
                 panel(&mut cols[0], "VOICE", |ui| {
-                    slider(ui, "Amplify", &mut self.voice_gain, 0.0..=3.0);
-                    slider(ui, "Master", &mut self.master_gain, 0.0..=1.5);
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amplify", &mut self.voice_gain, 0.0..=3.0);
+                        knob(ui, "Master", &mut self.master_gain, 0.0..=1.5);
+                    });
                 });
                 panel(&mut cols[1], "AUTOTUNE", |ui| {
                     ui.checkbox(&mut self.tune_on, "Enable");
-                    slider(ui, "Amount", &mut self.tune_amount, 0.0..=1.0);
-                    slider(ui, "Snap speed", &mut self.tune_retune, 0.05..=1.0);
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.tune_amount, 0.0..=1.0);
+                        knob(ui, "Snap", &mut self.tune_retune, 0.05..=1.0);
+                    });
                     ui.label("Key");
                     egui::ComboBox::from_id_salt("key")
                         .selected_text(NOTE_NAMES[self.key as usize])
@@ -366,17 +533,23 @@ impl eframe::App for BoothApp {
                         });
                 });
                 panel(&mut cols[2], "SPACE", |ui| {
-                    slider(ui, "Reverb", &mut self.reverb_mix, 0.0..=1.0);
-                    slider(ui, "Room size", &mut self.reverb_size, 0.0..=1.0);
-                    slider(ui, "Echo", &mut self.echo_mix, 0.0..=1.0);
-                    slider(ui, "Echo time", &mut self.echo_time, 0.08..=0.7);
+                    on_off_row(ui, "Reverb", &mut self.reverb_on);
+                    ui.horizontal(|ui| {
+                        knob(ui, "Reverb", &mut self.reverb_mix, 0.0..=1.0);
+                        knob(ui, "Room", &mut self.reverb_size, 0.0..=1.0);
+                    });
+                    on_off_row(ui, "Echo", &mut self.echo_on);
+                    ui.horizontal(|ui| {
+                        knob(ui, "Echo", &mut self.echo_mix, 0.0..=1.0);
+                        knob(ui, "Time", &mut self.echo_time, 0.08..=0.7);
+                    });
                 });
                 panel(&mut cols[3], "TRACK", |ui| {
                     ui.label(track_name);
                     if ui.button("Choose file").clicked() {
                         self.pick_track();
                     }
-                    slider(ui, "Track level", &mut self.track_gain, 0.0..=1.2);
+                    knob(ui, "Track", &mut self.track_gain, 0.0..=1.2);
                     let toggle = if playing { "Pause track" } else { "Play track" };
                     if ui.button(toggle).clicked() {
                         let next = !playing;
@@ -450,72 +623,100 @@ impl eframe::App for BoothApp {
             ui.label(RichText::new("VOICE FX").color(GOLD).small().strong());
             ui.add_space(6.0);
             ui.columns(4, |cols| {
-                panel(&mut cols[0], "ALIEN", |ui| {
-                    slider(ui, "Amount", &mut self.alien, 0.0..=1.0);
-                    slider(ui, "Mod rate", &mut self.alien_rate, 0.05..=1.0);
+                fx_panel(&mut cols[0], "ALIEN", &mut self.alien_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.alien, 0.0..=1.0);
+                        knob(ui, "Rate", &mut self.alien_rate, 0.05..=1.0);
+                    });
                 });
-                panel(&mut cols[1], "CHIPMUNK", |ui| {
-                    slider(ui, "Amount", &mut self.chipmunk, 0.0..=1.0);
-                    slider(ui, "Height", &mut self.chipmunk_height, 0.0..=1.0);
+                fx_panel(&mut cols[1], "CHIPMUNK", &mut self.chipmunk_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.chipmunk, 0.0..=1.0);
+                        knob(ui, "Height", &mut self.chipmunk_height, 0.0..=1.0);
+                    });
                 });
-                panel(&mut cols[2], "DEMON", |ui| {
-                    slider(ui, "Amount", &mut self.demon, 0.0..=1.0);
-                    slider(ui, "Depth", &mut self.demon_depth, 0.0..=1.0);
+                fx_panel(&mut cols[2], "DEMON", &mut self.demon_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.demon, 0.0..=1.0);
+                        knob(ui, "Depth", &mut self.demon_depth, 0.0..=1.0);
+                    });
                 });
-                panel(&mut cols[3], "ROBOT", |ui| {
-                    slider(ui, "Amount", &mut self.robot, 0.0..=1.0);
-                    slider(ui, "Crunch", &mut self.robot_crunch, 0.0..=1.0);
-                });
-            });
-            ui.add_space(8.0);
-            ui.columns(3, |cols| {
-                panel(&mut cols[0], "TELEPHONE", |ui| {
-                    slider(ui, "Amount", &mut self.telephone, 0.0..=1.0);
-                    slider(ui, "Tone", &mut self.telephone_tone, 0.0..=1.0);
-                });
-                panel(&mut cols[1], "CHORUS", |ui| {
-                    slider(ui, "Mix", &mut self.chorus, 0.0..=1.0);
-                    slider(ui, "Rate", &mut self.chorus_rate, 0.0..=1.0);
-                });
-                panel(&mut cols[2], "RADIO", |ui| {
-                    slider(ui, "Amount", &mut self.radio, 0.0..=1.0);
-                    slider(ui, "Static", &mut self.radio_static, 0.0..=1.0);
+                fx_panel(&mut cols[3], "ROBOT", &mut self.robot_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.robot, 0.0..=1.0);
+                        knob(ui, "Crunch", &mut self.robot_crunch, 0.0..=1.0);
+                    });
                 });
             });
             ui.add_space(8.0);
             ui.columns(3, |cols| {
-                panel(&mut cols[0], "VADER", |ui| {
-                    slider(ui, "Amount", &mut self.vader, 0.0..=1.0);
-                    slider(ui, "Dark", &mut self.vader_dark, 0.0..=1.0);
+                fx_panel(&mut cols[0], "TELEPHONE", &mut self.telephone_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.telephone, 0.0..=1.0);
+                        knob(ui, "Tone", &mut self.telephone_tone, 0.0..=1.0);
+                    });
                 });
-                panel(&mut cols[1], "FLANGE", |ui| {
-                    slider(ui, "Mix", &mut self.flange, 0.0..=1.0);
-                    slider(ui, "Rate", &mut self.flange_rate, 0.0..=1.0);
+                fx_panel(&mut cols[1], "CHORUS", &mut self.chorus_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Mix", &mut self.chorus, 0.0..=1.0);
+                        knob(ui, "Rate", &mut self.chorus_rate, 0.0..=1.0);
+                    });
                 });
-                panel(&mut cols[2], "PHASER", |ui| {
-                    slider(ui, "Mix", &mut self.phaser, 0.0..=1.0);
-                    slider(ui, "Rate", &mut self.phaser_rate, 0.0..=1.0);
+                fx_panel(&mut cols[2], "RADIO", &mut self.radio_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.radio, 0.0..=1.0);
+                        knob(ui, "Static", &mut self.radio_static, 0.0..=1.0);
+                    });
                 });
             });
             ui.add_space(8.0);
             ui.columns(3, |cols| {
-                panel(&mut cols[0], "VIBRATO", |ui| {
-                    slider(ui, "Amount", &mut self.vibrato, 0.0..=1.0);
-                    slider(ui, "Rate", &mut self.vibrato_rate, 0.0..=1.0);
+                fx_panel(&mut cols[0], "VADER", &mut self.vader_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.vader, 0.0..=1.0);
+                        knob(ui, "Dark", &mut self.vader_dark, 0.0..=1.0);
+                    });
                 });
-                panel(&mut cols[1], "OVERDRIVE", |ui| {
-                    slider(ui, "Amount", &mut self.overdrive, 0.0..=1.0);
-                    slider(ui, "Drive", &mut self.overdrive_drive, 0.0..=1.0);
+                fx_panel(&mut cols[1], "FLANGE", &mut self.flange_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Mix", &mut self.flange, 0.0..=1.0);
+                        knob(ui, "Rate", &mut self.flange_rate, 0.0..=1.0);
+                    });
                 });
-                panel(&mut cols[2], "UNDERWATER", |ui| {
-                    slider(ui, "Amount", &mut self.underwater, 0.0..=1.0);
-                    slider(ui, "Depth", &mut self.underwater_depth, 0.0..=1.0);
+                fx_panel(&mut cols[2], "PHASER", &mut self.phaser_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Mix", &mut self.phaser, 0.0..=1.0);
+                        knob(ui, "Rate", &mut self.phaser_rate, 0.0..=1.0);
+                    });
+                });
+            });
+            ui.add_space(8.0);
+            ui.columns(3, |cols| {
+                fx_panel(&mut cols[0], "VIBRATO", &mut self.vibrato_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.vibrato, 0.0..=1.0);
+                        knob(ui, "Rate", &mut self.vibrato_rate, 0.0..=1.0);
+                    });
+                });
+                fx_panel(&mut cols[1], "OVERDRIVE", &mut self.overdrive_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.overdrive, 0.0..=1.0);
+                        knob(ui, "Drive", &mut self.overdrive_drive, 0.0..=1.0);
+                    });
+                });
+                fx_panel(&mut cols[2], "UNDERWATER", &mut self.underwater_on, |ui| {
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.underwater, 0.0..=1.0);
+                        knob(ui, "Depth", &mut self.underwater_depth, 0.0..=1.0);
+                    });
                 });
             });
         });
+        self.autosave.tick(self.snapshot());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.autosave.flush(self.snapshot());
         if let Some(engine) = self.engine.take() {
             engine.stop();
         }
@@ -560,12 +761,113 @@ fn panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
-fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+fn fx_panel(ui: &mut egui::Ui, title: &str, on: &mut bool, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(PANEL)
+        .stroke(Stroke::new(1.0_f32, LINE))
+        .corner_radius(16.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).color(GOLD).small().strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    on_off_button(ui, on);
+                });
+            });
+            ui.add_space(6.0);
+            add(ui);
+        });
+}
+
+fn on_off_row(ui: &mut egui::Ui, label: &str, on: &mut bool) {
     ui.horizontal(|ui| {
-        ui.label(label);
+        ui.label(RichText::new(label).color(GOLD).small().strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(format!("{value:.2}"));
+            on_off_button(ui, on);
         });
     });
-    ui.add(egui::Slider::new(value, range).show_value(false));
+}
+
+fn on_off_button(ui: &mut egui::Ui, on: &mut bool) {
+    let text = if *on { "On" } else { "Off" };
+    let button = if *on {
+        egui::Button::new(RichText::new(text).color(Color32::WHITE)).fill(PINK)
+    } else {
+        egui::Button::new(RichText::new(text).color(MUTED))
+    };
+    if ui.add_sized(Vec2::new(48.0, 22.0), button).clicked() {
+        *on = !*on;
+    }
+}
+
+fn gated(on: bool, value: f32) -> f32 {
+    if on {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn knob(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+    ui.vertical(|ui| {
+        ui.set_min_width(68.0);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(50.0), Sense::click_and_drag());
+        let min = *range.start();
+        let max = *range.end();
+        let span = (max - min).max(1e-6);
+        if response.dragged() {
+            let dy = ui.input(|input| input.pointer.delta().y);
+            *value = (*value - dy * span / 130.0).clamp(min, max);
+        }
+        if response.hovered() {
+            let scroll = ui.input(|input| input.raw_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                *value = (*value + scroll.signum() * span * 0.04).clamp(min, max);
+            }
+        }
+        let t = ((*value - min) / span).clamp(0.0, 1.0);
+        let center = rect.center();
+        let radius = 19.0;
+        let painter = ui.painter_at(rect);
+        painter.circle_filled(center, radius, Color32::from_rgb(16, 12, 24));
+        painter.circle_stroke(center, radius, Stroke::new(2.0_f32, LINE));
+        let start = std::f32::consts::PI * 0.75;
+        let sweep = std::f32::consts::PI * 1.5;
+        let steps = 28;
+        let mut prev = None;
+        for i in 0..=steps {
+            let unit = i as f32 / steps as f32;
+            let angle = start + sweep * unit;
+            let point = Pos2::new(
+                center.x + radius * angle.cos(),
+                center.y + radius * angle.sin(),
+            );
+            if let Some(last) = prev {
+                let color = if unit <= t {
+                    PINK
+                } else {
+                    Color32::from_rgb(72, 58, 88)
+                };
+                painter.line_segment([last, point], Stroke::new(3.0_f32, color));
+            }
+            prev = Some(point);
+        }
+        let angle = start + sweep * t;
+        let tip = Pos2::new(
+            center.x + (radius - 5.0) * angle.cos(),
+            center.y + (radius - 5.0) * angle.sin(),
+        );
+        painter.line_segment([center, tip], Stroke::new(2.0_f32, GOLD));
+        let cap = if response.hovered() || response.dragged() {
+            PINK
+        } else {
+            GOLD
+        };
+        painter.circle_filled(center, 3.4, cap);
+        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.label(RichText::new(label).small().color(MUTED));
+            ui.label(RichText::new(format!("{value:.2}")).small().color(CYAN));
+        });
+    });
 }
