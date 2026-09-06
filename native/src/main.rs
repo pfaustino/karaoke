@@ -21,8 +21,8 @@ use track::Track;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 900.0])
-            .with_min_inner_size([720.0, 640.0])
+            .with_inner_size([980.0, 980.0])
+            .with_min_inner_size([720.0, 700.0])
             .with_title("Karaoke Booth"),
         ..Default::default()
     };
@@ -502,7 +502,7 @@ impl eframe::App for BoothApp {
                 });
 
             ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                 compact_panel(ui, "VOICE", |ui| {
                     ui.horizontal(|ui| {
@@ -545,85 +545,111 @@ impl eframe::App for BoothApp {
                         knob(ui, "Time", &mut self.echo_time, 0.08..=0.7);
                     });
                 });
-                fx_panel(ui, "ALIEN", &mut self.alien_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.alien, 0.0..=1.0);
-                        knob(ui, "Rate", &mut self.alien_rate, 0.05..=1.0);
-                    });
-                });
-                fx_panel(ui, "CHIPMUNK", &mut self.chipmunk_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.chipmunk, 0.0..=1.0);
-                        knob(ui, "Height", &mut self.chipmunk_height, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "DEMON", &mut self.demon_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.demon, 0.0..=1.0);
-                        knob(ui, "Depth", &mut self.demon_depth, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "ROBOT", &mut self.robot_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.robot, 0.0..=1.0);
-                        knob(ui, "Crunch", &mut self.robot_crunch, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "TELEPHONE", &mut self.telephone_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.telephone, 0.0..=1.0);
-                        knob(ui, "Tone", &mut self.telephone_tone, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "CHORUS", &mut self.chorus_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Mix", &mut self.chorus, 0.0..=1.0);
-                        knob(ui, "Rate", &mut self.chorus_rate, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "RADIO", &mut self.radio_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.radio, 0.0..=1.0);
-                        knob(ui, "Static", &mut self.radio_static, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "VADER", &mut self.vader_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.vader, 0.0..=1.0);
-                        knob(ui, "Dark", &mut self.vader_dark, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "FLANGE", &mut self.flange_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Mix", &mut self.flange, 0.0..=1.0);
-                        knob(ui, "Rate", &mut self.flange_rate, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "PHASER", &mut self.phaser_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Mix", &mut self.phaser, 0.0..=1.0);
-                        knob(ui, "Rate", &mut self.phaser_rate, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "VIBRATO", &mut self.vibrato_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.vibrato, 0.0..=1.0);
-                        knob(ui, "Rate", &mut self.vibrato_rate, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "OVERDRIVE", &mut self.overdrive_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.overdrive, 0.0..=1.0);
-                        knob(ui, "Drive", &mut self.overdrive_drive, 0.0..=1.0);
-                    });
-                });
-                fx_panel(ui, "UNDERWATER", &mut self.underwater_on, |ui| {
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.underwater, 0.0..=1.0);
-                        knob(ui, "Depth", &mut self.underwater_depth, 0.0..=1.0);
-                    });
-                });
             });
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("VOICE FX").color(GOLD).small().strong());
+            ui.add_space(6.0);
+            let sfx_cols = if ui.available_width() >= (CARD_INNER + 24.0) * 4.0 {
+                4
+            } else {
+                3
+            };
+            egui::Grid::new("sfx-grid")
+                .num_columns(sfx_cols)
+                .spacing([8.0, 8.0])
+                .min_col_width(CARD_INNER + 16.0)
+                .show(ui, |ui| {
+                    let mut placed = 0usize;
+                    let mut sfx = |ui: &mut egui::Ui,
+                                   title: &str,
+                                   on: &mut bool,
+                                   knobs: &mut dyn FnMut(&mut egui::Ui)| {
+                        fx_panel(ui, title, on, knobs);
+                        placed += 1;
+                        if placed % sfx_cols == 0 {
+                            ui.end_row();
+                        }
+                    };
+                    sfx(ui, "ALIEN", &mut self.alien_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.alien, 0.0..=1.0);
+                            knob(ui, "Rate", &mut self.alien_rate, 0.05..=1.0);
+                        });
+                    });
+                    sfx(ui, "CHIPMUNK", &mut self.chipmunk_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.chipmunk, 0.0..=1.0);
+                            knob(ui, "Height", &mut self.chipmunk_height, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "DEMON", &mut self.demon_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.demon, 0.0..=1.0);
+                            knob(ui, "Depth", &mut self.demon_depth, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "ROBOT", &mut self.robot_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.robot, 0.0..=1.0);
+                            knob(ui, "Crunch", &mut self.robot_crunch, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "TELEPHONE", &mut self.telephone_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.telephone, 0.0..=1.0);
+                            knob(ui, "Tone", &mut self.telephone_tone, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "CHORUS", &mut self.chorus_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Mix", &mut self.chorus, 0.0..=1.0);
+                            knob(ui, "Rate", &mut self.chorus_rate, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "RADIO", &mut self.radio_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.radio, 0.0..=1.0);
+                            knob(ui, "Static", &mut self.radio_static, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "VADER", &mut self.vader_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.vader, 0.0..=1.0);
+                            knob(ui, "Dark", &mut self.vader_dark, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "FLANGE", &mut self.flange_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Mix", &mut self.flange, 0.0..=1.0);
+                            knob(ui, "Rate", &mut self.flange_rate, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "PHASER", &mut self.phaser_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Mix", &mut self.phaser, 0.0..=1.0);
+                            knob(ui, "Rate", &mut self.phaser_rate, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "VIBRATO", &mut self.vibrato_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.vibrato, 0.0..=1.0);
+                            knob(ui, "Rate", &mut self.vibrato_rate, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "OVERDRIVE", &mut self.overdrive_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.overdrive, 0.0..=1.0);
+                            knob(ui, "Drive", &mut self.overdrive_drive, 0.0..=1.0);
+                        });
+                    });
+                    sfx(ui, "UNDERWATER", &mut self.underwater_on, &mut |ui| {
+                        ui.horizontal(|ui| {
+                            knob(ui, "Amount", &mut self.underwater, 0.0..=1.0);
+                            knob(ui, "Depth", &mut self.underwater_depth, 0.0..=1.0);
+                        });
+                    });
+                });
 
             ui.add_space(8.0);
             panel(ui, "TRACK", |ui| {
