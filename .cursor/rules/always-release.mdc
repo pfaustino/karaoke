@@ -1,0 +1,14 @@
+---
+description: Always ship a GitHub release after booth changes
+alwaysApply: true
+---
+
+# Always release
+
+After any user-facing karaoke booth change (native UI, audio, FX, settings), do not stop at a local exe.
+
+1. Bump `package.json` and `native/Cargo.toml` (patch unless asked otherwise).
+2. Run `npm run check` and fix until green.
+3. Build `native/target/release/karaoke-booth.exe` (use `native/target/alt-build` if the running exe is locked).
+4. Commit, `git push origin HEAD`, and `gh release create` with the exe attached.
+5. Tell Patrick the release URL and to close the old booth first.

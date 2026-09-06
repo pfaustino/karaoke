@@ -778,8 +778,8 @@ fn fx_panel(ui: &mut egui::Ui, title: &str, on: &mut bool, add: impl FnOnce(&mut
             ui.add_space(4.0);
             toggle_switch(ui, on);
             ui.add_space(6.0);
+            add(ui);
         });
-        add(ui);
     });
 }
 
@@ -796,7 +796,9 @@ fn sized_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
             .show(ui, |ui| {
                 ui.set_width(CARD_INNER);
                 ui.set_max_width(CARD_INNER);
-                add(ui);
+                ui.vertical(|ui| {
+                    add(ui);
+                });
             });
     });
 }
