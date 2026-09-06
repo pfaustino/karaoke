@@ -21,8 +21,8 @@ use track::Track;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 980.0])
-            .with_min_inner_size([720.0, 700.0])
+            .with_inner_size([1100.0, 980.0])
+            .with_min_inner_size([860.0, 700.0])
             .with_title("Karaoke Booth"),
         ..Default::default()
     };
@@ -499,6 +499,20 @@ impl eframe::App for BoothApp {
                         }
                         ui.label(RichText::new(status).color(if live { CYAN } else { MUTED }));
                     });
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("TRACK").color(GOLD).small().strong());
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(track_name);
+                        if ui.button("Choose file").clicked() {
+                            self.pick_track();
+                        }
+                        let toggle = if playing { "Pause" } else { "Play" };
+                        if ui.button(toggle).clicked() {
+                            self.shared.track_playing.store(!playing, Ordering::Relaxed);
+                        }
+                        knob(ui, "Level", &mut self.track_gain, 0.0..=1.2);
+                    });
                 });
 
             ui.add_space(10.0);
@@ -545,16 +559,67 @@ impl eframe::App for BoothApp {
                         knob(ui, "Time", &mut self.echo_time, 0.08..=0.7);
                     });
                 });
+                discord_panel(ui, |ui| {
+                    ui.checkbox(&mut self.send_discord, "Discord mode");
+                    if ui.button("Recording settings").clicked() {
+                        let _ = std::process::Command::new("control")
+                            .args(["mmsys.cpl,,1"])
+                            .spawn();
+                    }
+                    if let Some(name) = &self.stereo_mix_name {
+                        ui.label(
+                            RichText::new(format!("Use {name} in Discord"))
+                                .color(CYAN)
+                                .small(),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("Enable Stereo Mix, then set Discord input to it.")
+                                .color(MUTED)
+                                .small(),
+                        );
+                    }
+                    let has_virtual = self
+                        .playback_devices
+                        .iter()
+                        .any(|device| device.looks_virtual);
+                    if has_virtual {
+                        if ui.button("Refresh").clicked() {
+                            self.refresh_devices();
+                        }
+                        let selected_name = self
+                            .playback_devices
+                            .iter()
+                            .find(|device| device.id == self.discord_device_id)
+                            .map(|device| device.name.as_str())
+                            .unwrap_or("Cable");
+                        egui::ComboBox::from_id_salt("discord-device")
+                            .width(DISCORD_INNER - 4.0)
+                            .selected_text(selected_name)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.discord_device_id,
+                                    String::new(),
+                                    "None (Stereo Mix)",
+                                );
+                                for device in &self.playback_devices {
+                                    if device.looks_virtual {
+                                        ui.selectable_value(
+                                            &mut self.discord_device_id,
+                                            device.id.clone(),
+                                            device.name.clone(),
+                                        );
+                                    }
+                                }
+                            });
+                    }
+                });
             });
 
             ui.add_space(10.0);
             ui.label(RichText::new("VOICE FX").color(GOLD).small().strong());
             ui.add_space(6.0);
-            let sfx_cols = if ui.available_width() >= (CARD_INNER + 24.0) * 4.0 {
-                4
-            } else {
-                3
-            };
+            let sfx_cols = 5;
             egui::Grid::new("sfx-grid")
                 .num_columns(sfx_cols)
                 .spacing([8.0, 8.0])
@@ -651,66 +716,6 @@ impl eframe::App for BoothApp {
                     });
                 });
 
-            ui.add_space(8.0);
-            panel(ui, "TRACK", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(track_name);
-                    if ui.button("Choose file").clicked() {
-                        self.pick_track();
-                    }
-                    let toggle = if playing { "Pause" } else { "Play" };
-                    if ui.button(toggle).clicked() {
-                        self.shared.track_playing.store(!playing, Ordering::Relaxed);
-                    }
-                    knob(ui, "Level", &mut self.track_gain, 0.0..=1.2);
-                    ui.separator();
-                    ui.checkbox(&mut self.send_discord, "Discord mode");
-                    if ui.button("Recording settings").clicked() {
-                        let _ = std::process::Command::new("control")
-                            .args(["mmsys.cpl,,1"])
-                            .spawn();
-                    }
-                    if let Some(name) = &self.stereo_mix_name {
-                        ui.label(RichText::new(format!("Use {name} in Discord")).color(CYAN).small());
-                    } else {
-                        ui.label(
-                            RichText::new("Enable Stereo Mix, then set Discord input to it.")
-                                .color(MUTED)
-                                .small(),
-                        );
-                    }
-                    let has_virtual = self.playback_devices.iter().any(|device| device.looks_virtual);
-                    if has_virtual {
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_devices();
-                        }
-                        let selected_name = self
-                            .playback_devices
-                            .iter()
-                            .find(|device| device.id == self.discord_device_id)
-                            .map(|device| device.name.as_str())
-                            .unwrap_or("Cable");
-                        egui::ComboBox::from_id_salt("discord-device")
-                            .selected_text(selected_name)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.discord_device_id,
-                                    String::new(),
-                                    "None (Stereo Mix)",
-                                );
-                                for device in &self.playback_devices {
-                                    if device.looks_virtual {
-                                        ui.selectable_value(
-                                            &mut self.discord_device_id,
-                                            device.id.clone(),
-                                            device.name.clone(),
-                                        );
-                                    }
-                                }
-                            });
-                    }
-                });
-            });
         });
         self.autosave.tick(self.snapshot());
     }
@@ -732,6 +737,7 @@ const CYAN: Color32 = Color32::from_rgb(92, 225, 230);
 const MUTED: Color32 = Color32::from_rgb(183, 173, 200);
 const KNOB_COL: f32 = 58.0;
 const CARD_INNER: f32 = KNOB_COL * 2.0 + 6.0;
+const DISCORD_INNER: f32 = 220.0;
 
 fn apply_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
@@ -750,24 +756,33 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-fn panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new()
-        .fill(PANEL)
-        .stroke(Stroke::new(1.0_f32, LINE))
-        .corner_radius(12.0)
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            ui.label(RichText::new(title).color(GOLD).small().strong());
-            ui.add_space(4.0);
-            add(ui);
-        });
-}
-
 fn compact_panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     sized_card(ui, |ui| {
         ui.label(RichText::new(title).color(GOLD).small().strong());
         ui.add_space(4.0);
         add(ui);
+    });
+}
+
+fn discord_panel(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let outer = DISCORD_INNER + 16.0;
+    ui.scope(|ui| {
+        ui.set_min_width(outer);
+        ui.set_max_width(outer);
+        egui::Frame::new()
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0_f32, LINE))
+            .corner_radius(12.0)
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.set_width(DISCORD_INNER);
+                ui.set_max_width(DISCORD_INNER);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("DISCORD MODE").color(GOLD).small().strong());
+                    ui.add_space(4.0);
+                    add(ui);
+                });
+            });
     });
 }
 
