@@ -1,6 +1,6 @@
 # Karaoke Booth
 
-Live voice booth: amplify your mic, autotune, reverb, and character effects (alien, chipmunk, demon, robot, telephone, chorus, radio). Native Windows exe uses WASAPI for lower latency than the browser demo.
+Live voice booth: amplify your mic, autotune, reverb, and character effects (alien, chipmunk, demon, robot, telephone, chorus, radio, vader, flange, phaser, vibrato, overdrive, underwater). Native Windows exe uses WASAPI for lower latency than the browser demo.
 
 ## Native app (Windows)
 

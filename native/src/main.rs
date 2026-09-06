@@ -19,8 +19,8 @@ use track::Track;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 980.0])
-            .with_min_inner_size([880.0, 760.0])
+            .with_inner_size([1100.0, 1180.0])
+            .with_min_inner_size([880.0, 900.0])
             .with_title("Karaoke Booth"),
         ..Default::default()
     };
@@ -60,6 +60,18 @@ struct BoothApp {
     chorus_rate: f32,
     radio: f32,
     radio_static: f32,
+    vader: f32,
+    vader_dark: f32,
+    flange: f32,
+    flange_rate: f32,
+    phaser: f32,
+    phaser_rate: f32,
+    vibrato: f32,
+    vibrato_rate: f32,
+    overdrive: f32,
+    overdrive_drive: f32,
+    underwater: f32,
+    underwater_depth: f32,
     send_discord: bool,
     discord_device_id: String,
     playback_devices: Vec<PlaybackDevice>,
@@ -98,6 +110,18 @@ impl BoothApp {
             chorus_rate: 0.35,
             radio: 0.0,
             radio_static: 0.3,
+            vader: 0.0,
+            vader_dark: 0.7,
+            flange: 0.0,
+            flange_rate: 0.35,
+            phaser: 0.0,
+            phaser_rate: 0.4,
+            vibrato: 0.0,
+            vibrato_rate: 0.45,
+            overdrive: 0.0,
+            overdrive_drive: 0.55,
+            underwater: 0.0,
+            underwater_depth: 0.6,
             send_discord: false,
             discord_device_id: String::new(),
             playback_devices: Vec::new(),
@@ -148,6 +172,18 @@ impl BoothApp {
         store_f32(&self.shared.chorus_rate, self.chorus_rate);
         store_f32(&self.shared.radio, self.radio);
         store_f32(&self.shared.radio_static, self.radio_static);
+        store_f32(&self.shared.vader, self.vader);
+        store_f32(&self.shared.vader_dark, self.vader_dark);
+        store_f32(&self.shared.flange, self.flange);
+        store_f32(&self.shared.flange_rate, self.flange_rate);
+        store_f32(&self.shared.phaser, self.phaser);
+        store_f32(&self.shared.phaser_rate, self.phaser_rate);
+        store_f32(&self.shared.vibrato, self.vibrato);
+        store_f32(&self.shared.vibrato_rate, self.vibrato_rate);
+        store_f32(&self.shared.overdrive, self.overdrive);
+        store_f32(&self.shared.overdrive_drive, self.overdrive_drive);
+        store_f32(&self.shared.underwater, self.underwater);
+        store_f32(&self.shared.underwater_depth, self.underwater_depth);
         self.shared
             .send_discord
             .store(self.send_discord, Ordering::Relaxed);
@@ -444,6 +480,36 @@ impl eframe::App for BoothApp {
                 panel(&mut cols[2], "RADIO", |ui| {
                     slider(ui, "Amount", &mut self.radio, 0.0..=1.0);
                     slider(ui, "Static", &mut self.radio_static, 0.0..=1.0);
+                });
+            });
+            ui.add_space(8.0);
+            ui.columns(3, |cols| {
+                panel(&mut cols[0], "VADER", |ui| {
+                    slider(ui, "Amount", &mut self.vader, 0.0..=1.0);
+                    slider(ui, "Dark", &mut self.vader_dark, 0.0..=1.0);
+                });
+                panel(&mut cols[1], "FLANGE", |ui| {
+                    slider(ui, "Mix", &mut self.flange, 0.0..=1.0);
+                    slider(ui, "Rate", &mut self.flange_rate, 0.0..=1.0);
+                });
+                panel(&mut cols[2], "PHASER", |ui| {
+                    slider(ui, "Mix", &mut self.phaser, 0.0..=1.0);
+                    slider(ui, "Rate", &mut self.phaser_rate, 0.0..=1.0);
+                });
+            });
+            ui.add_space(8.0);
+            ui.columns(3, |cols| {
+                panel(&mut cols[0], "VIBRATO", |ui| {
+                    slider(ui, "Amount", &mut self.vibrato, 0.0..=1.0);
+                    slider(ui, "Rate", &mut self.vibrato_rate, 0.0..=1.0);
+                });
+                panel(&mut cols[1], "OVERDRIVE", |ui| {
+                    slider(ui, "Amount", &mut self.overdrive, 0.0..=1.0);
+                    slider(ui, "Drive", &mut self.overdrive_drive, 0.0..=1.0);
+                });
+                panel(&mut cols[2], "UNDERWATER", |ui| {
+                    slider(ui, "Amount", &mut self.underwater, 0.0..=1.0);
+                    slider(ui, "Depth", &mut self.underwater_depth, 0.0..=1.0);
                 });
             });
         });

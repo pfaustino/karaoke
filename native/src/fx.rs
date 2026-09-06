@@ -17,6 +17,18 @@ pub struct FxKnob {
     pub chorus_rate: f32,
     pub radio: f32,
     pub radio_static: f32,
+    pub vader: f32,
+    pub vader_dark: f32,
+    pub flange: f32,
+    pub flange_rate: f32,
+    pub phaser: f32,
+    pub phaser_rate: f32,
+    pub vibrato: f32,
+    pub vibrato_rate: f32,
+    pub overdrive: f32,
+    pub overdrive_drive: f32,
+    pub underwater: f32,
+    pub underwater_depth: f32,
 }
 
 impl Default for FxKnob {
@@ -36,6 +48,18 @@ impl Default for FxKnob {
             chorus_rate: 0.35,
             radio: 0.0,
             radio_static: 0.3,
+            vader: 0.0,
+            vader_dark: 0.7,
+            flange: 0.0,
+            flange_rate: 0.35,
+            phaser: 0.0,
+            phaser_rate: 0.4,
+            vibrato: 0.0,
+            vibrato_rate: 0.45,
+            overdrive: 0.0,
+            overdrive_drive: 0.55,
+            underwater: 0.0,
+            underwater_depth: 0.6,
         }
     }
 }
@@ -53,6 +77,20 @@ pub struct ColorFx {
     chorus: Vec<f32>,
     chorus_pos: usize,
     chorus_lfo: f32,
+    vader: GrainShift,
+    vader_lp: Biquad,
+    flange: Vec<f32>,
+    flange_pos: usize,
+    flange_lfo: f32,
+    flange_fb: f32,
+    phaser: [Biquad; 4],
+    phaser_lfo: f32,
+    phaser_fb: f32,
+    vibrato: Vec<f32>,
+    vibrato_pos: usize,
+    vibrato_lfo: f32,
+    underwater_lp: Biquad,
+    underwater_lfo: f32,
     sample_rate: f32,
 }
 
@@ -71,6 +109,25 @@ impl ColorFx {
             chorus: vec![0.0; (sample_rate * 0.04) as usize + 8],
             chorus_pos: 0,
             chorus_lfo: 0.0,
+            vader: GrainShift::new(),
+            vader_lp: Biquad::lowpass(sample_rate, 700.0, 0.7),
+            flange: vec![0.0; (sample_rate * 0.02) as usize + 8],
+            flange_pos: 0,
+            flange_lfo: 0.0,
+            flange_fb: 0.0,
+            phaser: [
+                Biquad::allpass(sample_rate, 200.0, 0.6),
+                Biquad::allpass(sample_rate, 400.0, 0.6),
+                Biquad::allpass(sample_rate, 800.0, 0.6),
+                Biquad::allpass(sample_rate, 1600.0, 0.6),
+            ],
+            phaser_lfo: 0.0,
+            phaser_fb: 0.0,
+            vibrato: vec![0.0; (sample_rate * 0.018) as usize + 8],
+            vibrato_pos: 0,
+            vibrato_lfo: 0.0,
+            underwater_lp: Biquad::lowpass(sample_rate, 500.0, 0.7),
+            underwater_lfo: 0.0,
             sample_rate,
         }
     }
@@ -142,6 +199,76 @@ impl ColorFx {
             self.chorus[self.chorus_pos] = x;
             self.chorus_pos = (self.chorus_pos + 1) % self.chorus.len();
             x = x * (1.0 - p.chorus * 0.55) + wet * p.chorus;
+        }
+        if p.vader > 0.001 {
+            let semitones = 5.0 + p.vader_dark * 5.0;
+            let shifted = self.vader.process(x, 2f32.powf(-semitones / 12.0));
+            let cutoff = 1100.0 - p.vader_dark * 750.0;
+            self.vader_lp.set_lowpass(self.sample_rate, cutoff, 0.75);
+            let dark = self.vader_lp.process(shifted);
+            let wet = (dark * 1.45).tanh();
+            x = x * (1.0 - p.vader) + wet * p.vader;
+        }
+        if p.flange > 0.001 {
+            let hz = 0.08 + p.flange_rate * 1.6;
+            self.flange_lfo += hz / self.sample_rate;
+            if self.flange_lfo > 1.0 {
+                self.flange_lfo -= 1.0;
+            }
+            let sweep = 0.5 + 0.5 * (self.flange_lfo * std::f32::consts::TAU).sin();
+            let delay = (0.0004 + sweep * 0.0075) * self.sample_rate;
+            let delayed = read_delay(&self.flange, self.flange_pos, delay);
+            let wet = (x + delayed).clamp(-1.0, 1.0);
+            self.flange_fb = (delayed * 0.45).clamp(-0.95, 0.95);
+            self.flange[self.flange_pos] = (x + self.flange_fb).clamp(-1.0, 1.0);
+            self.flange_pos = (self.flange_pos + 1) % self.flange.len();
+            x = x * (1.0 - p.flange * 0.65) + wet * p.flange;
+        }
+        if p.phaser > 0.001 {
+            let hz = 0.12 + p.phaser_rate * 2.4;
+            self.phaser_lfo += hz / self.sample_rate;
+            if self.phaser_lfo > 1.0 {
+                self.phaser_lfo -= 1.0;
+            }
+            let sweep = 0.5 + 0.5 * (self.phaser_lfo * std::f32::consts::TAU).sin();
+            let bases = [180.0, 420.0, 840.0, 1680.0];
+            let mut staged = (x + self.phaser_fb * 0.35).clamp(-1.0, 1.0);
+            for (filter, base) in self.phaser.iter_mut().zip(bases) {
+                filter.set_allpass(self.sample_rate, base * (0.55 + sweep * 1.6), 0.55);
+                staged = filter.process(staged);
+            }
+            self.phaser_fb = staged;
+            x = x * (1.0 - p.phaser * 0.6) + staged * p.phaser;
+        }
+        if p.vibrato > 0.001 {
+            let hz = 2.0 + p.vibrato_rate * 7.0;
+            self.vibrato_lfo += hz / self.sample_rate;
+            if self.vibrato_lfo > 1.0 {
+                self.vibrato_lfo -= 1.0;
+            }
+            let sweep = 0.5 + 0.5 * (self.vibrato_lfo * std::f32::consts::TAU).sin();
+            let delay = (0.001 + sweep * (0.003 + p.vibrato * 0.007)) * self.sample_rate;
+            let wet = read_delay(&self.vibrato, self.vibrato_pos, delay);
+            self.vibrato[self.vibrato_pos] = x;
+            self.vibrato_pos = (self.vibrato_pos + 1) % self.vibrato.len();
+            x = x * (1.0 - p.vibrato) + wet * p.vibrato;
+        }
+        if p.overdrive > 0.001 {
+            let drive = 1.6 + p.overdrive_drive * 8.0;
+            let wet = (x * drive).tanh();
+            x = x * (1.0 - p.overdrive) + wet * p.overdrive;
+        }
+        if p.underwater > 0.001 {
+            let cutoff = 900.0 - p.underwater_depth * 620.0;
+            self.underwater_lp.set_lowpass(self.sample_rate, cutoff, 0.8);
+            let filtered = self.underwater_lp.process(x);
+            self.underwater_lfo += (0.35 + p.underwater_depth * 1.4) / self.sample_rate;
+            if self.underwater_lfo > 1.0 {
+                self.underwater_lfo -= 1.0;
+            }
+            let wobble = 0.72 + 0.28 * (self.underwater_lfo * std::f32::consts::TAU).sin();
+            let wet = (filtered * wobble * 1.15).clamp(-1.0, 1.0);
+            x = x * (1.0 - p.underwater) + wet * p.underwater;
         }
         x
     }
@@ -226,8 +353,8 @@ struct Biquad {
 }
 
 impl Biquad {
-    fn bandpass(sample_rate: f32, cutoff: f32, q: f32) -> Self {
-        let mut filter = Self {
+    fn empty() -> Self {
+        Self {
             b0: 1.0,
             b1: 0.0,
             b2: 0.0,
@@ -235,8 +362,24 @@ impl Biquad {
             a2: 0.0,
             z1: 0.0,
             z2: 0.0,
-        };
+        }
+    }
+
+    fn bandpass(sample_rate: f32, cutoff: f32, q: f32) -> Self {
+        let mut filter = Self::empty();
         filter.set_bandpass(sample_rate, cutoff, q);
+        filter
+    }
+
+    fn lowpass(sample_rate: f32, cutoff: f32, q: f32) -> Self {
+        let mut filter = Self::empty();
+        filter.set_lowpass(sample_rate, cutoff, q);
+        filter
+    }
+
+    fn allpass(sample_rate: f32, cutoff: f32, q: f32) -> Self {
+        let mut filter = Self::empty();
+        filter.set_allpass(sample_rate, cutoff, q);
         filter
     }
 
@@ -249,6 +392,32 @@ impl Biquad {
         self.b0 = alpha / a0;
         self.b1 = 0.0;
         self.b2 = -alpha / a0;
+        self.a1 = -2.0 * cos / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    fn set_lowpass(&mut self, sample_rate: f32, cutoff: f32, q: f32) {
+        let w0 = 2.0 * std::f32::consts::PI * cutoff.max(40.0) / sample_rate;
+        let cos = w0.cos();
+        let sin = w0.sin();
+        let alpha = sin / (2.0 * q.max(0.2));
+        let a0 = 1.0 + alpha;
+        self.b0 = ((1.0 - cos) * 0.5) / a0;
+        self.b1 = (1.0 - cos) / a0;
+        self.b2 = ((1.0 - cos) * 0.5) / a0;
+        self.a1 = -2.0 * cos / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    fn set_allpass(&mut self, sample_rate: f32, cutoff: f32, q: f32) {
+        let w0 = 2.0 * std::f32::consts::PI * cutoff.max(40.0) / sample_rate;
+        let cos = w0.cos();
+        let sin = w0.sin();
+        let alpha = sin / (2.0 * q.max(0.2));
+        let a0 = 1.0 + alpha;
+        self.b0 = (1.0 - alpha) / a0;
+        self.b1 = -2.0 * cos / a0;
+        self.b2 = (1.0 + alpha) / a0;
         self.a1 = -2.0 * cos / a0;
         self.a2 = (1.0 - alpha) / a0;
     }
