@@ -9,7 +9,7 @@ npm run exe
 native\target\release\karaoke-booth.exe
 ```
 
-Headphones on. For Discord, check **Discord mode**, enable Windows **Stereo Mix** (Sound → Recording → Show Disabled Devices), and set Discord’s input to Stereo Mix. Turn off Discord noise suppression.
+Headphones on. For Discord, check **Discord mode**, enable Windows **Stereo Mix** (Sound → Recording → Show Disabled Devices), and set Discord’s input to Stereo Mix. Keep the Windows **default recording device** on your microphone. Turn off Discord noise suppression.
 
 ## Browser demo
 

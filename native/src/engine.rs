@@ -231,11 +231,41 @@ fn open_client(
     ))
 }
 
-fn open_shared_capture(sample_rate: usize) -> Result<(wasapi::AudioClient, wasapi::Handle, ClientInfo), String> {
-    let enumerator = DeviceEnumerator::new().map_err(|err| err.to_string())?;
-    let device = enumerator
+fn pick_capture_device(
+    enumerator: &DeviceEnumerator,
+) -> Result<(wasapi::Device, String), String> {
+    let default = enumerator
         .get_default_device(&Direction::Capture)
         .map_err(|err| err.to_string())?;
+    let default_name = default.get_friendlyname().unwrap_or_default();
+    if !is_stereo_mix_name(&default_name) {
+        return Ok((default, default_name));
+    }
+
+    let collection = enumerator
+        .get_device_collection(&Direction::Capture)
+        .map_err(|err| err.to_string())?;
+    let count = collection.get_nbr_devices().unwrap_or(0);
+    for index in 0..count {
+        let Ok(device) = collection.get_device_at_index(index) else {
+            continue;
+        };
+        let Ok(name) = device.get_friendlyname() else {
+            continue;
+        };
+        if !is_stereo_mix_name(&name) {
+            return Ok((device, name));
+        }
+    }
+    Err(
+        "Windows default input is Stereo Mix, so the booth heard silence. Keep Stereo Mix enabled for Discord, but set Sound → Recording default back to your microphone."
+            .into(),
+    )
+}
+
+fn open_shared_capture(sample_rate: usize) -> Result<(wasapi::AudioClient, wasapi::Handle, ClientInfo, String), String> {
+    let enumerator = DeviceEnumerator::new().map_err(|err| err.to_string())?;
+    let (device, name) = pick_capture_device(&enumerator)?;
     let desired = WaveFormat::new(32, 32, &SampleType::Float, sample_rate, 1, None);
     let mut client = device.get_iaudioclient().map_err(|err| err.to_string())?;
     let (_def, min_time) = client.get_device_period().map_err(|err| err.to_string())?;
@@ -257,6 +287,7 @@ fn open_shared_capture(sample_rate: usize) -> Result<(wasapi::AudioClient, wasap
             sample_rate: sample_rate as u32,
             block_align: desired.get_blockalign() as usize,
         },
+        name,
     ))
 }
 
@@ -317,12 +348,17 @@ fn capture_thread(
     shared: Arc<Shared>,
 ) -> Result<(), String> {
     let rate = wait_for_output(&shared, &stop)?;
-    let (client, event, info) = open_shared_capture(rate)?;
+    let (client, event, info, mic_name) = open_shared_capture(rate)?;
     let capture = client
         .get_audiocaptureclient()
         .map_err(|err| err.to_string())?;
     let mut queue = VecDeque::new();
     client.start_stream().map_err(|err| err.to_string())?;
+    if let Ok(mut status) = shared.status.lock() {
+        if !status.is_empty() {
+            *status = format!("{status} · mic {mic_name}");
+        }
+    }
 
     while !stop.load(Ordering::Relaxed) {
         if event.wait_for_event(200).is_err() {
@@ -586,4 +622,24 @@ fn encode_frames(mono: &[f32], info: &ClientInfo) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_stereo_mix_name, is_virtual_cable_name};
+
+    #[test]
+    fn stereo_mix_is_not_a_microphone() {
+        assert!(is_stereo_mix_name("Stereo Mix (Realtek(R) Audio)"));
+        assert!(is_stereo_mix_name("What U Hear"));
+        assert!(is_stereo_mix_name("Wave Out Mix"));
+        assert!(!is_stereo_mix_name("Headset Microphone (Realtek(R) Audio)"));
+        assert!(!is_stereo_mix_name("USB PnP Sound Device"));
+    }
+
+    #[test]
+    fn virtual_cable_names_stay_narrow() {
+        assert!(is_virtual_cable_name("CABLE Input (VB-Audio Virtual Cable)"));
+        assert!(!is_virtual_cable_name("Speakers (Realtek(R) Audio)"));
+    }
 }
