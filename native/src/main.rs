@@ -21,8 +21,8 @@ use track::Track;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 920.0])
-            .with_min_inner_size([880.0, 760.0])
+            .with_inner_size([1100.0, 860.0])
+            .with_min_inner_size([900.0, 700.0])
             .with_title("Karaoke Booth"),
         ..Default::default()
     };
@@ -501,30 +501,31 @@ impl eframe::App for BoothApp {
                     });
                 });
 
-            ui.add_space(14.0);
-            ui.columns(4, |cols| {
-                panel(&mut cols[0], "VOICE", |ui| {
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                compact_panel(ui, "VOICE", |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amplify", &mut self.voice_gain, 0.0..=3.0);
                         knob(ui, "Master", &mut self.master_gain, 0.0..=1.5);
                     });
                 });
-                panel(&mut cols[1], "AUTOTUNE", |ui| {
+                compact_panel(ui, "AUTOTUNE", |ui| {
                     ui.checkbox(&mut self.tune_on, "Enable");
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.tune_amount, 0.0..=1.0);
                         knob(ui, "Snap", &mut self.tune_retune, 0.05..=1.0);
                     });
-                    ui.label("Key");
                     egui::ComboBox::from_id_salt("key")
-                        .selected_text(NOTE_NAMES[self.key as usize])
+                        .width(CARD_INNER - 4.0)
+                        .selected_text(format!("Key {}", NOTE_NAMES[self.key as usize]))
                         .show_ui(ui, |ui| {
                             for (i, name) in NOTE_NAMES.iter().enumerate() {
                                 ui.selectable_value(&mut self.key, i as i32, *name);
                             }
                         });
-                    ui.label("Scale");
                     egui::ComboBox::from_id_salt("scale")
+                        .width(CARD_INNER - 4.0)
                         .selected_text(["Chromatic", "Major", "Minor"][self.scale])
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.scale, 0, "Chromatic");
@@ -532,7 +533,7 @@ impl eframe::App for BoothApp {
                             ui.selectable_value(&mut self.scale, 2, "Minor");
                         });
                 });
-                panel(&mut cols[2], "SPACE", |ui| {
+                compact_panel(ui, "SPACE", |ui| {
                     on_off_row(ui, "Reverb", &mut self.reverb_on);
                     ui.horizontal(|ui| {
                         knob(ui, "Reverb", &mut self.reverb_mix, 0.0..=1.0);
@@ -544,50 +545,39 @@ impl eframe::App for BoothApp {
                         knob(ui, "Time", &mut self.echo_time, 0.08..=0.7);
                     });
                 });
-                panel(&mut cols[3], "TRACK", |ui| {
+            });
+
+            ui.add_space(8.0);
+            panel(ui, "TRACK", |ui| {
+                ui.horizontal(|ui| {
                     ui.label(track_name);
                     if ui.button("Choose file").clicked() {
                         self.pick_track();
                     }
-                    knob(ui, "Track", &mut self.track_gain, 0.0..=1.2);
-                    let toggle = if playing { "Pause track" } else { "Play track" };
+                    let toggle = if playing { "Pause" } else { "Play" };
                     if ui.button(toggle).clicked() {
-                        let next = !playing;
-                        self.shared.track_playing.store(next, Ordering::Relaxed);
+                        self.shared.track_playing.store(!playing, Ordering::Relaxed);
                     }
+                    knob(ui, "Level", &mut self.track_gain, 0.0..=1.2);
                     ui.separator();
                     ui.checkbox(&mut self.send_discord, "Discord mode");
-                    ui.label(
-                        RichText::new("Free path: Windows Stereo Mix. No paid cable.")
-                            .color(MUTED)
-                            .small(),
-                    );
-                    if let Some(name) = &self.stereo_mix_name {
-                        ui.label(
-                            RichText::new(format!("Found {name}. In Discord, set Input Device to that."))
-                                .color(CYAN)
-                                .small(),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new("Enable Stereo Mix: Recording tab → right-click empty area → Show Disabled Devices → enable Stereo Mix.")
-                                .color(MUTED)
-                                .small(),
-                        );
-                    }
-                    if ui.button("Open sound recording settings").clicked() {
+                    if ui.button("Recording settings").clicked() {
                         let _ = std::process::Command::new("control")
                             .args(["mmsys.cpl,,1"])
                             .spawn();
                     }
-                    ui.label(
-                        RichText::new("Then Discord → Voice & Video → Input = Stereo Mix. Turn off Discord noise suppression. Headphones on. Restart the booth mic after checking Discord mode.")
-                            .color(MUTED)
-                            .small(),
-                    );
+                    if let Some(name) = &self.stereo_mix_name {
+                        ui.label(RichText::new(format!("Use {name} in Discord")).color(CYAN).small());
+                    } else {
+                        ui.label(
+                            RichText::new("Enable Stereo Mix, then set Discord input to it.")
+                                .color(MUTED)
+                                .small(),
+                        );
+                    }
                     let has_virtual = self.playback_devices.iter().any(|device| device.looks_virtual);
                     if has_virtual {
-                        if ui.button("Refresh devices").clicked() {
+                        if ui.button("Refresh").clicked() {
                             self.refresh_devices();
                         }
                         let selected_name = self
@@ -595,116 +585,107 @@ impl eframe::App for BoothApp {
                             .iter()
                             .find(|device| device.id == self.discord_device_id)
                             .map(|device| device.name.as_str())
-                            .unwrap_or("Optional virtual cable");
+                            .unwrap_or("Cable");
                         egui::ComboBox::from_id_salt("discord-device")
                             .selected_text(selected_name)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
                                     &mut self.discord_device_id,
                                     String::new(),
-                                    "None (use Stereo Mix)",
+                                    "None (Stereo Mix)",
                                 );
                                 for device in &self.playback_devices {
-                                    if !device.looks_virtual {
-                                        continue;
+                                    if device.looks_virtual {
+                                        ui.selectable_value(
+                                            &mut self.discord_device_id,
+                                            device.id.clone(),
+                                            device.name.clone(),
+                                        );
                                     }
-                                    ui.selectable_value(
-                                        &mut self.discord_device_id,
-                                        device.id.clone(),
-                                        device.name.clone(),
-                                    );
                                 }
                             });
                     }
                 });
             });
 
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             ui.label(RichText::new("VOICE FX").color(GOLD).small().strong());
             ui.add_space(6.0);
-            ui.columns(4, |cols| {
-                fx_panel(&mut cols[0], "ALIEN", &mut self.alien_on, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                fx_panel(ui, "ALIEN", &mut self.alien_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.alien, 0.0..=1.0);
                         knob(ui, "Rate", &mut self.alien_rate, 0.05..=1.0);
                     });
                 });
-                fx_panel(&mut cols[1], "CHIPMUNK", &mut self.chipmunk_on, |ui| {
+                fx_panel(ui, "CHIPMUNK", &mut self.chipmunk_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.chipmunk, 0.0..=1.0);
                         knob(ui, "Height", &mut self.chipmunk_height, 0.0..=1.0);
                     });
                 });
-                fx_panel(&mut cols[2], "DEMON", &mut self.demon_on, |ui| {
+                fx_panel(ui, "DEMON", &mut self.demon_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.demon, 0.0..=1.0);
                         knob(ui, "Depth", &mut self.demon_depth, 0.0..=1.0);
                     });
                 });
-                fx_panel(&mut cols[3], "ROBOT", &mut self.robot_on, |ui| {
+                fx_panel(ui, "ROBOT", &mut self.robot_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.robot, 0.0..=1.0);
                         knob(ui, "Crunch", &mut self.robot_crunch, 0.0..=1.0);
                     });
                 });
-            });
-            ui.add_space(8.0);
-            ui.columns(3, |cols| {
-                fx_panel(&mut cols[0], "TELEPHONE", &mut self.telephone_on, |ui| {
+                fx_panel(ui, "TELEPHONE", &mut self.telephone_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.telephone, 0.0..=1.0);
                         knob(ui, "Tone", &mut self.telephone_tone, 0.0..=1.0);
                     });
                 });
-                fx_panel(&mut cols[1], "CHORUS", &mut self.chorus_on, |ui| {
+                fx_panel(ui, "CHORUS", &mut self.chorus_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Mix", &mut self.chorus, 0.0..=1.0);
                         knob(ui, "Rate", &mut self.chorus_rate, 0.0..=1.0);
                     });
                 });
-                fx_panel(&mut cols[2], "RADIO", &mut self.radio_on, |ui| {
+                fx_panel(ui, "RADIO", &mut self.radio_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.radio, 0.0..=1.0);
                         knob(ui, "Static", &mut self.radio_static, 0.0..=1.0);
                     });
                 });
-            });
-            ui.add_space(8.0);
-            ui.columns(3, |cols| {
-                fx_panel(&mut cols[0], "VADER", &mut self.vader_on, |ui| {
+                fx_panel(ui, "VADER", &mut self.vader_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.vader, 0.0..=1.0);
                         knob(ui, "Dark", &mut self.vader_dark, 0.0..=1.0);
                     });
                 });
-                fx_panel(&mut cols[1], "FLANGE", &mut self.flange_on, |ui| {
+                fx_panel(ui, "FLANGE", &mut self.flange_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Mix", &mut self.flange, 0.0..=1.0);
                         knob(ui, "Rate", &mut self.flange_rate, 0.0..=1.0);
                     });
                 });
-                fx_panel(&mut cols[2], "PHASER", &mut self.phaser_on, |ui| {
+                fx_panel(ui, "PHASER", &mut self.phaser_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Mix", &mut self.phaser, 0.0..=1.0);
                         knob(ui, "Rate", &mut self.phaser_rate, 0.0..=1.0);
                     });
                 });
-            });
-            ui.add_space(8.0);
-            ui.columns(3, |cols| {
-                fx_panel(&mut cols[0], "VIBRATO", &mut self.vibrato_on, |ui| {
+                fx_panel(ui, "VIBRATO", &mut self.vibrato_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.vibrato, 0.0..=1.0);
                         knob(ui, "Rate", &mut self.vibrato_rate, 0.0..=1.0);
                     });
                 });
-                fx_panel(&mut cols[1], "OVERDRIVE", &mut self.overdrive_on, |ui| {
+                fx_panel(ui, "OVERDRIVE", &mut self.overdrive_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.overdrive, 0.0..=1.0);
                         knob(ui, "Drive", &mut self.overdrive_drive, 0.0..=1.0);
                     });
                 });
-                fx_panel(&mut cols[2], "UNDERWATER", &mut self.underwater_on, |ui| {
+                fx_panel(ui, "UNDERWATER", &mut self.underwater_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.underwater, 0.0..=1.0);
                         knob(ui, "Depth", &mut self.underwater_depth, 0.0..=1.0);
@@ -730,6 +711,8 @@ const PINK: Color32 = Color32::from_rgb(255, 45, 149);
 const GOLD: Color32 = Color32::from_rgb(255, 209, 102);
 const CYAN: Color32 = Color32::from_rgb(92, 225, 230);
 const MUTED: Color32 = Color32::from_rgb(183, 173, 200);
+const KNOB_COL: f32 = 58.0;
+const CARD_INNER: f32 = KNOB_COL * 2.0 + 6.0;
 
 fn apply_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
@@ -752,29 +735,43 @@ fn panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(PANEL)
         .stroke(Stroke::new(1.0_f32, LINE))
-        .corner_radius(16.0)
-        .inner_margin(12.0)
+        .corner_radius(12.0)
+        .inner_margin(10.0)
         .show(ui, |ui| {
             ui.label(RichText::new(title).color(GOLD).small().strong());
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             add(ui);
         });
 }
 
+fn compact_panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    sized_card(ui, |ui| {
+        ui.label(RichText::new(title).color(GOLD).small().strong());
+        ui.add_space(4.0);
+        add(ui);
+    });
+}
+
 fn fx_panel(ui: &mut egui::Ui, title: &str, on: &mut bool, add: impl FnOnce(&mut egui::Ui)) {
+    sized_card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).color(GOLD).small().strong());
+        });
+        on_off_button(ui, on);
+        ui.add_space(4.0);
+        add(ui);
+    });
+}
+
+fn sized_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(PANEL)
         .stroke(Stroke::new(1.0_f32, LINE))
-        .corner_radius(16.0)
-        .inner_margin(12.0)
+        .corner_radius(12.0)
+        .inner_margin(8.0)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(title).color(GOLD).small().strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    on_off_button(ui, on);
-                });
-            });
-            ui.add_space(6.0);
+            ui.set_width(CARD_INNER);
+            ui.set_max_width(CARD_INNER);
             add(ui);
         });
 }
@@ -782,9 +779,8 @@ fn fx_panel(ui: &mut egui::Ui, title: &str, on: &mut bool, add: impl FnOnce(&mut
 fn on_off_row(ui: &mut egui::Ui, label: &str, on: &mut bool) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).color(GOLD).small().strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            on_off_button(ui, on);
-        });
+        ui.add_space(8.0);
+        on_off_button(ui, on);
     });
 }
 
@@ -809,10 +805,12 @@ fn gated(on: bool, value: f32) -> f32 {
 }
 
 fn knob(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
-    ui.vertical(|ui| {
-        ui.set_min_width(68.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(KNOB_COL, 86.0),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
-        let (rect, response) = ui.allocate_exact_size(Vec2::splat(50.0), Sense::click_and_drag());
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click_and_drag());
         let min = *range.start();
         let max = *range.end();
         let span = (max - min).max(1e-6);
@@ -828,7 +826,7 @@ fn knob(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeI
         }
         let t = ((*value - min) / span).clamp(0.0, 1.0);
         let center = rect.center();
-        let radius = 19.0;
+        let radius = 17.0;
         let painter = ui.painter_at(rect);
         painter.circle_filled(center, radius, Color32::from_rgb(16, 12, 24));
         painter.circle_stroke(center, radius, Stroke::new(2.0_f32, LINE));
