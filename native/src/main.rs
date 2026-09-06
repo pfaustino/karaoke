@@ -21,8 +21,8 @@ use track::Track;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 860.0])
-            .with_min_inner_size([900.0, 700.0])
+            .with_inner_size([1100.0, 900.0])
+            .with_min_inner_size([720.0, 640.0])
             .with_title("Karaoke Booth"),
         ..Default::default()
     };
@@ -512,10 +512,6 @@ impl eframe::App for BoothApp {
                 });
                 compact_panel(ui, "AUTOTUNE", |ui| {
                     ui.checkbox(&mut self.tune_on, "Enable");
-                    ui.horizontal(|ui| {
-                        knob(ui, "Amount", &mut self.tune_amount, 0.0..=1.0);
-                        knob(ui, "Snap", &mut self.tune_retune, 0.05..=1.0);
-                    });
                     egui::ComboBox::from_id_salt("key")
                         .width(CARD_INNER - 4.0)
                         .selected_text(format!("Key {}", NOTE_NAMES[self.key as usize]))
@@ -532,6 +528,10 @@ impl eframe::App for BoothApp {
                             ui.selectable_value(&mut self.scale, 1, "Major");
                             ui.selectable_value(&mut self.scale, 2, "Minor");
                         });
+                    ui.horizontal(|ui| {
+                        knob(ui, "Amount", &mut self.tune_amount, 0.0..=1.0);
+                        knob(ui, "Snap", &mut self.tune_retune, 0.05..=1.0);
+                    });
                 });
                 compact_panel(ui, "SPACE", |ui| {
                     on_off_row(ui, "Reverb", &mut self.reverb_on);
@@ -545,74 +545,6 @@ impl eframe::App for BoothApp {
                         knob(ui, "Time", &mut self.echo_time, 0.08..=0.7);
                     });
                 });
-            });
-
-            ui.add_space(8.0);
-            panel(ui, "TRACK", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(track_name);
-                    if ui.button("Choose file").clicked() {
-                        self.pick_track();
-                    }
-                    let toggle = if playing { "Pause" } else { "Play" };
-                    if ui.button(toggle).clicked() {
-                        self.shared.track_playing.store(!playing, Ordering::Relaxed);
-                    }
-                    knob(ui, "Level", &mut self.track_gain, 0.0..=1.2);
-                    ui.separator();
-                    ui.checkbox(&mut self.send_discord, "Discord mode");
-                    if ui.button("Recording settings").clicked() {
-                        let _ = std::process::Command::new("control")
-                            .args(["mmsys.cpl,,1"])
-                            .spawn();
-                    }
-                    if let Some(name) = &self.stereo_mix_name {
-                        ui.label(RichText::new(format!("Use {name} in Discord")).color(CYAN).small());
-                    } else {
-                        ui.label(
-                            RichText::new("Enable Stereo Mix, then set Discord input to it.")
-                                .color(MUTED)
-                                .small(),
-                        );
-                    }
-                    let has_virtual = self.playback_devices.iter().any(|device| device.looks_virtual);
-                    if has_virtual {
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_devices();
-                        }
-                        let selected_name = self
-                            .playback_devices
-                            .iter()
-                            .find(|device| device.id == self.discord_device_id)
-                            .map(|device| device.name.as_str())
-                            .unwrap_or("Cable");
-                        egui::ComboBox::from_id_salt("discord-device")
-                            .selected_text(selected_name)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.discord_device_id,
-                                    String::new(),
-                                    "None (Stereo Mix)",
-                                );
-                                for device in &self.playback_devices {
-                                    if device.looks_virtual {
-                                        ui.selectable_value(
-                                            &mut self.discord_device_id,
-                                            device.id.clone(),
-                                            device.name.clone(),
-                                        );
-                                    }
-                                }
-                            });
-                    }
-                });
-            });
-
-            ui.add_space(10.0);
-            ui.label(RichText::new("VOICE FX").color(GOLD).small().strong());
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                 fx_panel(ui, "ALIEN", &mut self.alien_on, |ui| {
                     ui.horizontal(|ui| {
                         knob(ui, "Amount", &mut self.alien, 0.0..=1.0);
@@ -692,6 +624,67 @@ impl eframe::App for BoothApp {
                     });
                 });
             });
+
+            ui.add_space(8.0);
+            panel(ui, "TRACK", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(track_name);
+                    if ui.button("Choose file").clicked() {
+                        self.pick_track();
+                    }
+                    let toggle = if playing { "Pause" } else { "Play" };
+                    if ui.button(toggle).clicked() {
+                        self.shared.track_playing.store(!playing, Ordering::Relaxed);
+                    }
+                    knob(ui, "Level", &mut self.track_gain, 0.0..=1.2);
+                    ui.separator();
+                    ui.checkbox(&mut self.send_discord, "Discord mode");
+                    if ui.button("Recording settings").clicked() {
+                        let _ = std::process::Command::new("control")
+                            .args(["mmsys.cpl,,1"])
+                            .spawn();
+                    }
+                    if let Some(name) = &self.stereo_mix_name {
+                        ui.label(RichText::new(format!("Use {name} in Discord")).color(CYAN).small());
+                    } else {
+                        ui.label(
+                            RichText::new("Enable Stereo Mix, then set Discord input to it.")
+                                .color(MUTED)
+                                .small(),
+                        );
+                    }
+                    let has_virtual = self.playback_devices.iter().any(|device| device.looks_virtual);
+                    if has_virtual {
+                        if ui.button("Refresh").clicked() {
+                            self.refresh_devices();
+                        }
+                        let selected_name = self
+                            .playback_devices
+                            .iter()
+                            .find(|device| device.id == self.discord_device_id)
+                            .map(|device| device.name.as_str())
+                            .unwrap_or("Cable");
+                        egui::ComboBox::from_id_salt("discord-device")
+                            .selected_text(selected_name)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.discord_device_id,
+                                    String::new(),
+                                    "None (Stereo Mix)",
+                                );
+                                for device in &self.playback_devices {
+                                    if device.looks_virtual {
+                                        ui.selectable_value(
+                                            &mut self.discord_device_id,
+                                            device.id.clone(),
+                                            device.name.clone(),
+                                        );
+                                    }
+                                }
+                            });
+                    }
+                });
+            });
         });
         self.autosave.tick(self.snapshot());
     }
@@ -754,46 +747,61 @@ fn compact_panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)
 
 fn fx_panel(ui: &mut egui::Ui, title: &str, on: &mut bool, add: impl FnOnce(&mut egui::Ui)) {
     sized_card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.vertical_centered(|ui| {
             ui.label(RichText::new(title).color(GOLD).small().strong());
+            ui.add_space(4.0);
+            toggle_switch(ui, on);
+            ui.add_space(6.0);
         });
-        on_off_button(ui, on);
-        ui.add_space(4.0);
         add(ui);
     });
 }
 
 fn sized_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new()
-        .fill(PANEL)
-        .stroke(Stroke::new(1.0_f32, LINE))
-        .corner_radius(12.0)
-        .inner_margin(8.0)
-        .show(ui, |ui| {
-            ui.set_width(CARD_INNER);
-            ui.set_max_width(CARD_INNER);
-            add(ui);
-        });
+    let outer = CARD_INNER + 16.0;
+    ui.scope(|ui| {
+        ui.set_min_width(outer);
+        ui.set_max_width(outer);
+        egui::Frame::new()
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0_f32, LINE))
+            .corner_radius(12.0)
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.set_width(CARD_INNER);
+                ui.set_max_width(CARD_INNER);
+                add(ui);
+            });
+    });
 }
 
 fn on_off_row(ui: &mut egui::Ui, label: &str, on: &mut bool) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).color(GOLD).small().strong());
-        ui.add_space(8.0);
-        on_off_button(ui, on);
+        ui.add_space(6.0);
+        toggle_switch(ui, on);
     });
 }
 
-fn on_off_button(ui: &mut egui::Ui, on: &mut bool) {
-    let text = if *on { "On" } else { "Off" };
-    let button = if *on {
-        egui::Button::new(RichText::new(text).color(Color32::WHITE)).fill(PINK)
-    } else {
-        egui::Button::new(RichText::new(text).color(MUTED))
-    };
-    if ui.add_sized(Vec2::new(48.0, 22.0), button).clicked() {
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) {
+    let size = Vec2::new(36.0, 18.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if response.clicked() {
         *on = !*on;
     }
+    let fill = if *on {
+        PINK
+    } else {
+        Color32::from_rgb(70, 56, 80)
+    };
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 9.0, fill);
+    let knob_x = if *on {
+        rect.right() - 9.0
+    } else {
+        rect.left() + 9.0
+    };
+    painter.circle_filled(Pos2::new(knob_x, rect.center().y), 6.5, Color32::WHITE);
 }
 
 fn gated(on: bool, value: f32) -> f32 {
