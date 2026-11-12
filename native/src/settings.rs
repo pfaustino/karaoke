@@ -21,6 +21,7 @@ pub struct SavedSettings {
     pub echo_mix: f32,
     pub echo_time: f32,
     pub track_gain: f32,
+    pub dry_monitor: bool,
     pub send_discord: bool,
     pub alien_on: bool,
     pub alien: f32,
@@ -80,6 +81,7 @@ impl Default for SavedSettings {
             echo_mix: 0.22,
             echo_time: 0.26,
             track_gain: 0.7,
+            dry_monitor: false,
             send_discord: false,
             alien_on: true,
             alien: 0.0,
@@ -194,6 +196,7 @@ mod tests {
         assert!((parsed.vader - 0.8).abs() < f32::EPSILON);
         assert!(!parsed.vader_on);
         assert!(parsed.flange_on);
+        assert!(!parsed.dry_monitor);
         assert!((parsed.voice_gain - 1.4).abs() < f32::EPSILON);
     }
 }

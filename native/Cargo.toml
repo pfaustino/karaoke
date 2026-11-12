@@ -1,6 +1,6 @@
 [package]
 name = "karaoke-booth"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Low-latency native karaoke voice booth"
 
@@ -13,6 +13,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "ogg", "wav", "pcm"] }
 wasapi = "0.24"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+] }
+windows-core = "0.62"
 
 [profile.release]
 lto = true

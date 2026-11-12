@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "karaoke-booth"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "eframe",
  "egui",
@@ -1695,6 +1695,8 @@ dependencies = [
  "serde_json",
  "symphonia",
  "wasapi",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

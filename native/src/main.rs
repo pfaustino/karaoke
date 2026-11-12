@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dry_monitor;
 mod dsp;
 mod engine;
 mod fx;
@@ -50,6 +51,7 @@ struct BoothApp {
     echo_mix: f32,
     echo_time: f32,
     track_gain: f32,
+    dry_monitor: bool,
     alien_on: bool,
     alien: f32,
     alien_rate: f32,
@@ -116,6 +118,7 @@ impl BoothApp {
             echo_mix: 0.22,
             echo_time: 0.26,
             track_gain: 0.7,
+            dry_monitor: false,
             alien_on: true,
             alien: 0.0,
             alien_rate: 0.45,
@@ -196,6 +199,9 @@ impl BoothApp {
         store_f32(&self.shared.echo_mix, gated(self.echo_on, self.echo_mix));
         store_f32(&self.shared.echo_time, self.echo_time);
         store_f32(&self.shared.track_gain, self.track_gain);
+        self.shared
+            .dry_monitor
+            .store(self.dry_monitor, Ordering::Relaxed);
         store_f32(&self.shared.alien, gated(self.alien_on, self.alien));
         store_f32(&self.shared.alien_rate, self.alien_rate);
         store_f32(&self.shared.chipmunk, gated(self.chipmunk_on, self.chipmunk));
@@ -303,6 +309,7 @@ impl BoothApp {
             echo_mix: self.echo_mix,
             echo_time: self.echo_time,
             track_gain: self.track_gain,
+            dry_monitor: self.dry_monitor,
             send_discord: self.send_discord,
             alien_on: self.alien_on,
             alien: self.alien,
@@ -361,6 +368,7 @@ impl BoothApp {
         self.echo_mix = saved.echo_mix;
         self.echo_time = saved.echo_time;
         self.track_gain = saved.track_gain;
+        self.dry_monitor = saved.dry_monitor;
         self.send_discord = saved.send_discord;
         self.alien_on = saved.alien_on;
         self.alien = saved.alien;
@@ -519,6 +527,38 @@ impl eframe::App for BoothApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                 compact_panel(ui, "VOICE", |ui| {
+                    ui.checkbox(&mut self.dry_monitor, "Dry monitor")
+                        .on_hover_text(
+                            self.engine
+                                .as_ref()
+                                .and_then(Engine::dry_monitor_metrics)
+                                .map(|m| m.summary())
+                                .unwrap_or_else(|| {
+                                    "Routes unprocessed mic audio directly to output with minimal buffer."
+                                        .to_string()
+                                }),
+                        );
+                    if live && self.dry_monitor {
+                        let dry_us = self.shared.dry_latency_us.load(Ordering::Relaxed);
+                        if dry_us > 0 {
+                            ui.label(
+                                RichText::new(format!("Dry ~{:.1} ms", dry_us as f32 / 1000.0))
+                                    .color(CYAN)
+                                    .small(),
+                            );
+                        } else if let Some(metrics) =
+                            self.engine.as_ref().and_then(Engine::dry_monitor_metrics)
+                        {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Dry ~{:.1} ms",
+                                    metrics.capture_period_ms() + metrics.render_period_ms()
+                                ))
+                                .color(CYAN)
+                                .small(),
+                            );
+                        }
+                    }
                     ui.horizontal(|ui| {
                         knob(ui, "Amplify", &mut self.voice_gain, 0.0..=3.0);
                         knob(ui, "Master", &mut self.master_gain, 0.0..=1.5);

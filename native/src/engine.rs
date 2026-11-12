@@ -9,6 +9,7 @@ use wasapi::{
     Direction, DeviceEnumerator, SampleType, StreamMode, WaveFormat, initialize_mta,
 };
 
+use crate::dry_monitor::{DryMonitor, DryMonitorMetrics};
 use crate::dsp::VoiceChain;
 use crate::state::{load_f32, Shared};
 
@@ -94,6 +95,7 @@ pub fn stereo_mix_device_name() -> Option<String> {
 pub struct Engine {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    dry_monitor: Option<DryMonitor>,
 }
 
 impl Engine {
@@ -101,6 +103,7 @@ impl Engine {
         let _ = initialize_mta();
         shared.sample_rate.store(0, Ordering::Relaxed);
         shared.output_ready.store(false, Ordering::Relaxed);
+        let dry_monitor = DryMonitor::start(Arc::clone(&shared)).ok();
         let stop = Arc::new(AtomicBool::new(false));
         let send_discord = shared.send_discord.load(Ordering::Relaxed);
         let discord_device = shared
@@ -143,7 +146,7 @@ impl Engine {
                     cable_out,
                     out_stop,
                     out_shared.clone(),
-                    !send_discord,
+                    false,
                 ) {
                     out_shared.set_status(format!("Output error: {err}"));
                     out_shared.live.store(false, Ordering::Relaxed);
@@ -172,11 +175,19 @@ impl Engine {
         Ok(Self {
             stop,
             threads,
+            dry_monitor,
         })
+    }
+
+    pub fn dry_monitor_metrics(&self) -> Option<&DryMonitorMetrics> {
+        self.dry_monitor.as_ref().map(DryMonitor::metrics)
     }
 
     pub fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(dry) = self.dry_monitor {
+            dry.stop();
+        }
         for handle in self.threads {
             let _ = handle.join();
         }
@@ -231,7 +242,7 @@ fn open_client(
     ))
 }
 
-fn pick_capture_device(
+pub(crate) fn pick_capture_device(
     enumerator: &DeviceEnumerator,
 ) -> Result<(wasapi::Device, String), String> {
     let default = enumerator
