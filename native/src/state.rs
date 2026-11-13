@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::dsp::Params;
@@ -47,6 +48,14 @@ pub struct Shared {
     pub track_gain: AtomicU32,
     pub dry_monitor: AtomicBool,
     pub dry_latency_us: AtomicU32,
+    pub dry_ring_fill_frames: AtomicU32,
+    pub dry_max_ring_frames: AtomicU32,
+    pub dry_underruns: AtomicU64,
+    pub dry_overruns: AtomicU64,
+    pub wet_ring_fill_frames: AtomicU32,
+    pub wet_max_ring_frames: AtomicU32,
+    pub wet_underruns: AtomicU64,
+    pub wet_overruns: AtomicU64,
     pub send_discord: AtomicBool,
     pub discord_device: Mutex<String>,
     pub track_playing: AtomicBool,
@@ -59,7 +68,8 @@ pub struct Shared {
     pub sample_rate: AtomicU32,
     pub latency_us: AtomicU32,
     pub status: Mutex<String>,
-    pub track: Mutex<Option<Arc<Track>>>,
+    track_ptr: AtomicPtr<Track>,
+    track_keepalive: Mutex<Vec<Arc<Track>>>,
 }
 
 impl Shared {
@@ -106,6 +116,14 @@ impl Shared {
             track_gain: AtomicU32::new(0.7f32.to_bits()),
             dry_monitor: AtomicBool::new(false),
             dry_latency_us: AtomicU32::new(0),
+            dry_ring_fill_frames: AtomicU32::new(0),
+            dry_max_ring_frames: AtomicU32::new(0),
+            dry_underruns: AtomicU64::new(0),
+            dry_overruns: AtomicU64::new(0),
+            wet_ring_fill_frames: AtomicU32::new(0),
+            wet_max_ring_frames: AtomicU32::new(0),
+            wet_underruns: AtomicU64::new(0),
+            wet_overruns: AtomicU64::new(0),
             send_discord: AtomicBool::new(false),
             discord_device: Mutex::new(String::new()),
             track_playing: AtomicBool::new(false),
@@ -118,7 +136,57 @@ impl Shared {
             sample_rate: AtomicU32::new(0),
             latency_us: AtomicU32::new(0),
             status: Mutex::new("Mic is off".to_string()),
-            track: Mutex::new(None),
+            track_ptr: AtomicPtr::new(ptr::null_mut()),
+            track_keepalive: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn reset_stream_metrics(&self) {
+        self.sample_rate.store(0, Ordering::Relaxed);
+        self.output_ready.store(false, Ordering::Relaxed);
+        self.latency_us.store(0, Ordering::Relaxed);
+        self.dry_latency_us.store(0, Ordering::Relaxed);
+        self.dry_ring_fill_frames.store(0, Ordering::Relaxed);
+        self.dry_max_ring_frames.store(0, Ordering::Relaxed);
+        self.dry_underruns.store(0, Ordering::Relaxed);
+        self.dry_overruns.store(0, Ordering::Relaxed);
+        self.wet_ring_fill_frames.store(0, Ordering::Relaxed);
+        self.wet_max_ring_frames.store(0, Ordering::Relaxed);
+        self.wet_underruns.store(0, Ordering::Relaxed);
+        self.wet_overruns.store(0, Ordering::Relaxed);
+    }
+
+    pub fn set_track(&self, track: Arc<Track>) {
+        let raw = Arc::as_ptr(&track).cast_mut();
+        if let Ok(mut keepalive) = self.track_keepalive.lock() {
+            keepalive.push(track);
+        } else {
+            return;
+        }
+        self.track_ptr.store(raw, Ordering::Release);
+    }
+
+    /// Lock-free, allocation-free track read for real-time audio callbacks.
+    /// Every `Arc<Track>` published into `track_ptr` stays retained in `track_keepalive`
+    /// until `reclaim_old_tracks` runs after all audio threads have stopped, or `Shared` drops.
+    pub fn load_track(&self) -> Option<&Track> {
+        let raw = self.track_ptr.load(Ordering::Acquire);
+        if raw.is_null() {
+            None
+        } else {
+            Some(unsafe { &*raw })
+        }
+    }
+
+    pub fn track_name(&self) -> Option<String> {
+        self.load_track().map(|t| t.name.clone())
+    }
+
+    /// Reclaims superseded `Arc<Track>` allocations once all audio threads have joined.
+    pub fn reclaim_old_tracks(&self) {
+        let current = self.track_ptr.load(Ordering::Acquire) as *const Track;
+        if let Ok(mut keepalive) = self.track_keepalive.lock() {
+            keepalive.retain(|arc| ptr::eq(Arc::as_ptr(arc), current));
         }
     }
 

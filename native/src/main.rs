@@ -282,9 +282,7 @@ impl BoothApp {
         match Track::load(&path) {
             Ok(track) => {
                 let name = track.name.clone();
-                if let Ok(mut slot) = self.shared.track.lock() {
-                    *slot = Some(Arc::new(track));
-                }
+                self.shared.set_track(Arc::new(track));
                 self.shared.track_frame.store(0, Ordering::Relaxed);
                 self.shared.track_playing.store(true, Ordering::Relaxed);
                 self.shared.set_status(format!("Playing {name}"));
@@ -421,18 +419,33 @@ impl eframe::App for BoothApp {
         let freq = load_f32(&self.shared.freq);
         let target = load_f32(&self.shared.target_midi);
         let rms = load_f32(&self.shared.rms);
-        let status = self
+        let base_status = self
             .shared
             .status
             .lock()
             .map(|s| s.clone())
             .unwrap_or_default();
+        let status = if live {
+            if let Some(m) = self.engine.as_ref().and_then(Engine::dry_monitor_metrics) {
+                format!(
+                    "{base_status} · wet ring {}/{}f (u:{} o:{}) · dry ring {}/{}f (u:{})",
+                    m.wet_ring_fill_frames,
+                    m.wet_max_ring_frames,
+                    m.wet_underruns,
+                    m.wet_overruns,
+                    m.dry_ring_fill_frames,
+                    m.dry_max_ring_frames,
+                    m.dry_underruns,
+                )
+            } else {
+                base_status
+            }
+        } else {
+            base_status
+        };
         let track_name = self
             .shared
-            .track
-            .lock()
-            .ok()
-            .and_then(|t| t.as_ref().map(|track| track.name.clone()))
+            .track_name()
             .unwrap_or_else(|| "No file chosen".to_string());
         let playing = self.shared.track_playing.load(Ordering::Relaxed);
 

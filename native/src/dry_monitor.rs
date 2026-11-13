@@ -26,7 +26,7 @@ use windows_core::{HSTRING, PCSTR};
 use crate::engine::pick_capture_device;
 use crate::state::Shared;
 
-const DRY_RING_CAPACITY: usize = 4096;
+pub(crate) const DRY_RING_CAPACITY: usize = 4096;
 const RAMP_STEP: f32 = 1.0 / 64.0;
 const WAVE_FORMAT_PCM_TAG: u16 = 1;
 
@@ -40,13 +40,30 @@ pub struct DryMonitorMetrics {
     pub capture_buffer_frames: u32,
     pub capture_raw_mode: bool,
     pub capture_low_period_api: bool,
+    pub capture_periodicity_locked: bool,
     pub render_rate: u32,
     pub render_period_frames: u32,
     pub render_min_period_frames: u32,
     pub render_default_period_frames: u32,
     pub render_buffer_frames: u32,
     pub render_low_period_api: bool,
+    pub render_periodicity_locked: bool,
     pub initial_latency_us: u32,
+    pub dry_ring_fill_frames: u32,
+    pub dry_max_ring_frames: u32,
+    pub dry_underruns: u64,
+    pub dry_overruns: u64,
+    pub wet_target_name: String,
+    pub wet_rate: u32,
+    pub wet_period_frames: u32,
+    pub wet_min_period_frames: u32,
+    pub wet_buffer_frames: u32,
+    pub wet_low_period_api: bool,
+    pub wet_periodicity_locked: bool,
+    pub wet_ring_fill_frames: u32,
+    pub wet_max_ring_frames: u32,
+    pub wet_underruns: u64,
+    pub wet_overruns: u64,
 }
 
 impl DryMonitorMetrics {
@@ -60,7 +77,7 @@ impl DryMonitorMetrics {
 
     pub fn summary(&self) -> String {
         format!(
-            "mic '{}' ({} Hz, period {}/{}..{} frames, buf {}, raw={}, iaudioclient3={}) -> render ({} Hz, period {}/{}..{} frames, buf {}, iaudioclient3={})",
+            "dry: mic '{}' ({} Hz, period {}/{}..{}f, buf {}, raw={}, iaudioclient3={}, locked={}) -> default render ({} Hz, period {}/{}..{}f, buf {}, iaudioclient3={}, locked={}) | ring {}/{}f, underruns {}, overruns {}\nwet: -> {} ({} Hz, period {}/{}f, buf {}, iaudioclient3={}, locked={}) | ring {}/{}f, underruns {}, overruns {}",
             self.mic_name,
             self.capture_rate,
             self.capture_period_frames,
@@ -69,17 +86,34 @@ impl DryMonitorMetrics {
             self.capture_buffer_frames,
             self.capture_raw_mode,
             self.capture_low_period_api,
+            self.capture_periodicity_locked,
             self.render_rate,
             self.render_period_frames,
             self.render_min_period_frames,
             self.render_default_period_frames,
             self.render_buffer_frames,
             self.render_low_period_api,
+            self.render_periodicity_locked,
+            self.dry_ring_fill_frames,
+            self.dry_max_ring_frames,
+            self.dry_underruns,
+            self.dry_overruns,
+            self.wet_target_name,
+            self.wet_rate,
+            self.wet_period_frames,
+            self.wet_min_period_frames,
+            self.wet_buffer_frames,
+            self.wet_low_period_api,
+            self.wet_periodicity_locked,
+            self.wet_ring_fill_frames,
+            self.wet_max_ring_frames,
+            self.wet_underruns,
+            self.wet_overruns,
         )
     }
 }
 
-fn frames_to_ms(frames: u32, rate: u32) -> f32 {
+pub(crate) fn frames_to_ms(frames: u32, rate: u32) -> f32 {
     if rate == 0 {
         0.0
     } else {
@@ -138,7 +172,7 @@ impl DryMonitor {
         }
     }
 
-    pub fn metrics(&self) -> &DryMonitorMetrics {
+    pub fn base_metrics(&self) -> &DryMonitorMetrics {
         &self.metrics
     }
 
@@ -157,17 +191,17 @@ unsafe impl Send for StopEvent {}
 unsafe impl Sync for StopEvent {}
 
 impl StopEvent {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         let handle = unsafe { CreateEventA(None, true, false, PCSTR::null()) }
             .map_err(|err| err.to_string())?;
         Ok(Self(handle.0 as isize))
     }
 
-    fn raw(&self) -> HANDLE {
+    pub(crate) fn raw(&self) -> HANDLE {
         HANDLE(self.0 as *mut core::ffi::c_void)
     }
 
-    fn signal(&self) {
+    pub(crate) fn signal(&self) {
         unsafe {
             let _ = SetEvent(self.raw());
         }
@@ -182,7 +216,7 @@ impl Drop for StopEvent {
     }
 }
 
-struct LocalEvent(HANDLE);
+pub(crate) struct LocalEvent(HANDLE);
 
 impl LocalEvent {
     fn new() -> Result<Self, String> {
@@ -191,7 +225,7 @@ impl LocalEvent {
         Ok(Self(handle))
     }
 
-    fn raw(&self) -> HANDLE {
+    pub(crate) fn raw(&self) -> HANDLE {
         self.0
     }
 }
@@ -204,10 +238,10 @@ impl Drop for LocalEvent {
     }
 }
 
-struct MmcssGuard(Option<HANDLE>);
+pub(crate) struct MmcssGuard(Option<HANDLE>);
 
 impl MmcssGuard {
-    fn elevate_pro_audio() -> Self {
+    pub(crate) fn elevate_pro_audio() -> Self {
         let mut task_index = 0u32;
         let task = HSTRING::from("Pro Audio");
         let handle = unsafe { AvSetMmThreadCharacteristicsW(&task, &mut task_index) }.ok();
@@ -236,7 +270,7 @@ impl Drop for MixFormatGuard {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SampleEncoding {
+pub(crate) enum SampleEncoding {
     Float32,
     Pcm16,
     Pcm24,
@@ -244,23 +278,24 @@ enum SampleEncoding {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct EndpointFormat {
-    sample_rate: u32,
-    channels: usize,
-    block_align: usize,
-    encoding: SampleEncoding,
+pub(crate) struct EndpointFormat {
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: usize,
+    pub(crate) block_align: usize,
+    pub(crate) encoding: SampleEncoding,
 }
 
-struct LowLatencyEndpoint {
-    client: IAudioClient,
-    event: LocalEvent,
-    format: EndpointFormat,
-    period_frames: u32,
-    min_period_frames: u32,
-    default_period_frames: u32,
-    buffer_frames: u32,
-    raw_mode: bool,
-    low_period_api: bool,
+pub(crate) struct LowLatencyEndpoint {
+    pub(crate) client: IAudioClient,
+    pub(crate) event: LocalEvent,
+    pub(crate) format: EndpointFormat,
+    pub(crate) period_frames: u32,
+    pub(crate) min_period_frames: u32,
+    pub(crate) default_period_frames: u32,
+    pub(crate) buffer_frames: u32,
+    pub(crate) raw_mode: bool,
+    pub(crate) low_period_api: bool,
+    pub(crate) periodicity_locked: bool,
 }
 
 /// Runs the dedicated low-latency dry monitoring loop on its own real-time MMCSS thread.
@@ -288,8 +323,8 @@ pub(crate) fn run_dry_monitor(
         let out_device = unsafe { com_enum.GetDefaultAudioEndpoint(eRender, eConsole) }
             .map_err(|err| err.to_string())?;
 
-        let cap = open_low_latency_endpoint(&cap_device, true)?;
-        let out = open_low_latency_endpoint(&out_device, false)?;
+        let cap = open_low_latency_endpoint(&cap_device, "dry-capture", true)?;
+        let out = open_low_latency_endpoint(&out_device, "dry-render", false)?;
         Ok((cap, out, mic_name))
     })();
 
@@ -319,23 +354,83 @@ pub(crate) fn run_dry_monitor(
     let out_period = out.period_frames.max(1) as usize;
     let out_buffer = out.buffer_frames.max(1) as usize;
     let prime_frames = out_period.min(out_buffer);
+    let max_ring_frames = (cap_in_out_frames + out_period).max(out_period * 2);
+    let trim_target_frames = cap_in_out_frames.max(out_period);
+    let target_render_padding = out_period.min(out_buffer);
 
-    if let Err(err) = prime_silent(&render_client, prime_frames) {
+    let mut ring = DryRing::new();
+    let mut resampler = StreamingResampler::new(cap.format.sample_rate, out.format.sample_rate);
+    let mut dry_underruns = 0u64;
+    let mut dry_overruns = 0u64;
+    let mut gain = 0.0f32;
+    let mut last_sample = 0.0f32;
+    let mut was_enabled = shared.dry_monitor.load(Ordering::Relaxed);
+
+    // Start capture first and wait for the first non-empty packet so capture leads render in phase.
+    if let Err(err) = unsafe { cap.client.Start() }.map_err(|e| e.to_string()) {
         let _ = init_tx.send(Err(err.clone()));
         return Err(err);
+    }
+    let pre_handles = [stop_signal.raw(), cap.event.raw()];
+    let deadline = std::time::Instant::now() + Duration::from_millis(50);
+    while ring.len() < cap_in_out_frames && std::time::Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = unsafe { WaitForMultipleObjects(&pre_handles, false, 15) };
+        dry_overruns = dry_overruns.saturating_add(drain_capture_packets(
+            &capture_client,
+            &cap.format,
+            &mut resampler,
+            &mut ring,
+        ));
+    }
+
+    if was_enabled && ring.len() >= prime_frames {
+        gain = 1.0;
+        if let Err(err) = write_dry_frames(
+            &render_client,
+            prime_frames,
+            &out.format,
+            &mut ring,
+            &mut gain,
+            1.0,
+            &mut last_sample,
+            &mut dry_underruns,
+        ) {
+            unsafe {
+                let _ = cap.client.Stop();
+            }
+            let _ = init_tx.send(Err(err.clone()));
+            return Err(err);
+        }
+    } else {
+        ring.trim_to(trim_target_frames);
+        if let Err(err) = prime_silent(&render_client, prime_frames) {
+            unsafe {
+                let _ = cap.client.Stop();
+            }
+            let _ = init_tx.send(Err(err.clone()));
+            return Err(err);
+        }
     }
 
     if let Err(err) = unsafe { out.client.Start() }.map_err(|e| e.to_string()) {
-        let _ = init_tx.send(Err(err.clone()));
-        return Err(err);
-    }
-    if let Err(err) = unsafe { cap.client.Start() }.map_err(|e| e.to_string()) {
         unsafe {
-            let _ = out.client.Stop();
+            let _ = cap.client.Stop();
         }
         let _ = init_tx.send(Err(err.clone()));
         return Err(err);
     }
+
+    shared
+        .dry_max_ring_frames
+        .store(max_ring_frames as u32, Ordering::Relaxed);
+    shared
+        .dry_ring_fill_frames
+        .store(ring.len() as u32, Ordering::Relaxed);
+    shared.dry_underruns.store(dry_underruns, Ordering::Relaxed);
+    shared.dry_overruns.store(dry_overruns, Ordering::Relaxed);
 
     let initial_total_frames = (cap_in_out_frames + prime_frames) as u64;
     let initial_latency_us =
@@ -350,36 +445,52 @@ pub(crate) fn run_dry_monitor(
         capture_buffer_frames: cap.buffer_frames,
         capture_raw_mode: cap.raw_mode,
         capture_low_period_api: cap.low_period_api,
+        capture_periodicity_locked: cap.periodicity_locked,
         render_rate: out.format.sample_rate,
         render_period_frames: out.period_frames,
         render_min_period_frames: out.min_period_frames,
         render_default_period_frames: out.default_period_frames,
         render_buffer_frames: out.buffer_frames,
         render_low_period_api: out.low_period_api,
+        render_periodicity_locked: out.periodicity_locked,
         initial_latency_us,
+        dry_ring_fill_frames: ring.len() as u32,
+        dry_max_ring_frames: max_ring_frames as u32,
+        dry_underruns,
+        dry_overruns,
+        wet_target_name: String::new(),
+        wet_rate: 0,
+        wet_period_frames: 0,
+        wet_min_period_frames: 0,
+        wet_buffer_frames: 0,
+        wet_low_period_api: false,
+        wet_periodicity_locked: false,
+        wet_ring_fill_frames: 0,
+        wet_max_ring_frames: 0,
+        wet_underruns: 0,
+        wet_overruns: 0,
     };
     let _ = init_tx.send(Ok(metrics));
 
-    let mut ring = DryRing::new();
-    let mut resampler = StreamingResampler::new(cap.format.sample_rate, out.format.sample_rate);
-    let max_ring_frames = (cap_in_out_frames + out_period).max(out_period * 2);
-    let trim_target_frames = cap_in_out_frames.max(out_period);
-    let target_render_padding = out_period.min(out_buffer);
-
-    let mut gain = 0.0f32;
-    let mut last_sample = 0.0f32;
-    let mut was_enabled = false;
     let wait_handles = [stop_signal.raw(), cap.event.raw(), out.event.raw()];
 
+    // Real-time audio callback loop: no heap allocations, locks, logging, or blocking calls.
     while !stop.load(Ordering::Relaxed) {
         let wait = unsafe { WaitForMultipleObjects(&wait_handles, false, 50) };
         if stop.load(Ordering::Relaxed) || wait == WAIT_OBJECT_0 {
             break;
         }
 
-        drain_capture_packets(&capture_client, &cap.format, &mut resampler, &mut ring);
+        let cap_overruns =
+            drain_capture_packets(&capture_client, &cap.format, &mut resampler, &mut ring);
+        if cap_overruns > 0 {
+            dry_overruns = dry_overruns.saturating_add(cap_overruns);
+            shared.dry_overruns.store(dry_overruns, Ordering::Relaxed);
+        }
         if ring.len() > max_ring_frames {
             ring.trim_to(trim_target_frames);
+            dry_overruns = dry_overruns.saturating_add(1);
+            shared.dry_overruns.store(dry_overruns, Ordering::Relaxed);
         }
 
         let Ok(padding_u32) = (unsafe { out.client.GetCurrentPadding() }) else {
@@ -391,24 +502,31 @@ pub(crate) fn run_dry_monitor(
             .saturating_sub(padding)
             .min(available);
         if to_write == 0 {
+            shared
+                .dry_ring_fill_frames
+                .store(ring.len() as u32, Ordering::Relaxed);
             continue;
         }
 
         let enabled = shared.dry_monitor.load(Ordering::Relaxed);
         if enabled && !was_enabled {
-            ring.trim_to(out_period);
+            ring.trim_to(trim_target_frames);
         }
         was_enabled = enabled;
 
         if !enabled && gain <= 1e-5 {
             gain = 0.0;
             last_sample = 0.0;
-            ring.clear();
+            ring.trim_to(trim_target_frames);
+            shared
+                .dry_ring_fill_frames
+                .store(ring.len() as u32, Ordering::Relaxed);
             let _ = prime_silent(&render_client, to_write);
             continue;
         }
 
         let target_gain = if enabled { 1.0 } else { 0.0 };
+        let prev_underruns = dry_underruns;
         if write_dry_frames(
             &render_client,
             to_write,
@@ -417,20 +535,29 @@ pub(crate) fn run_dry_monitor(
             &mut gain,
             target_gain,
             &mut last_sample,
+            &mut dry_underruns,
         )
         .is_err()
         {
             break;
         }
+        if dry_underruns != prev_underruns {
+            shared.dry_underruns.store(dry_underruns, Ordering::Relaxed);
+        }
 
+        let ring_fill = ring.len();
+        shared
+            .dry_ring_fill_frames
+            .store(ring_fill as u32, Ordering::Relaxed);
         let post_padding = padding + to_write;
-        let in_flight_frames = (cap_in_out_frames + ring.len() + post_padding) as u64;
+        let in_flight_frames = (cap_in_out_frames + ring_fill + post_padding) as u64;
         let latency_us =
             ((in_flight_frames * 1_000_000) / out.format.sample_rate.max(1) as u64) as u32;
         shared.dry_latency_us.store(latency_us, Ordering::Relaxed);
     }
 
     shared.dry_latency_us.store(0, Ordering::Relaxed);
+    shared.dry_ring_fill_frames.store(0, Ordering::Relaxed);
     unsafe {
         let _ = cap.client.Stop();
         let _ = out.client.Stop();
@@ -438,18 +565,29 @@ pub(crate) fn run_dry_monitor(
     Ok(())
 }
 
-fn open_low_latency_endpoint(
+pub(crate) fn open_low_latency_endpoint(
     device: &IMMDevice,
+    stream_label: &str,
     request_raw: bool,
 ) -> Result<LowLatencyEndpoint, String> {
-    if let Ok(opened) = try_open_audioclient3(device, request_raw) {
-        return Ok(opened);
+    match try_open_audioclient3(device, stream_label, request_raw) {
+        Ok(opened) => Ok(opened),
+        Err(err) => {
+            let fallback = open_fallback_audioclient(device)?;
+            eprintln!(
+                "[audio] {stream_label}: IAudioClient3 unavailable ({err}); fallback IAudioClient granted period {} frames ({:.2} ms) @ {} Hz",
+                fallback.period_frames,
+                frames_to_ms(fallback.period_frames, fallback.format.sample_rate),
+                fallback.format.sample_rate,
+            );
+            Ok(fallback)
+        }
     }
-    open_fallback_audioclient(device)
 }
 
 fn try_open_audioclient3(
     device: &IMMDevice,
+    stream_label: &str,
     request_raw: bool,
 ) -> Result<LowLatencyEndpoint, String> {
     let mut client3: IAudioClient3 =
@@ -537,6 +675,24 @@ fn try_open_audioclient3(
                 )
             }
             .map_err(|e| e.to_string())?;
+            let mut verify_fmt: *mut WAVEFORMATEX = core::ptr::null_mut();
+            let mut granted_period = cur_period;
+            if unsafe {
+                fresh.GetCurrentSharedModeEnginePeriod(&mut verify_fmt, &mut granted_period)
+            }
+            .is_ok()
+            {
+                let _verify_guard = MixFormatGuard(verify_fmt);
+                if granted_period == 0 {
+                    granted_period = cur_period;
+                }
+            }
+            eprintln!(
+                "[audio] {stream_label}: AUDCLNT_E_ENGINE_PERIODICITY_LOCKED — requested min {desired_period} frames ({:.2} ms), granted {granted_period} frames ({:.2} ms) @ {} Hz",
+                frames_to_ms(desired_period, format.sample_rate),
+                frames_to_ms(granted_period, parsed.sample_rate),
+                parsed.sample_rate,
+            );
             let event = LocalEvent::new()?;
             unsafe { fresh.SetEventHandle(event.raw()) }.map_err(|e| e.to_string())?;
             let buffer_frames = unsafe { fresh.GetBufferSize() }.map_err(|e| e.to_string())?;
@@ -545,12 +701,13 @@ fn try_open_audioclient3(
                 client: base,
                 event,
                 format: parsed,
-                period_frames: cur_period,
+                period_frames: granted_period,
                 min_period_frames: min_period,
                 default_period_frames: default_period,
                 buffer_frames,
                 raw_mode,
                 low_period_api: true,
+                periodicity_locked: true,
             });
         }
         return Err(err.to_string());
@@ -564,6 +721,14 @@ fn try_open_audioclient3(
         if actual_period > 0 {
             chosen_period = actual_period;
         }
+    }
+    if chosen_period != desired_period {
+        eprintln!(
+            "[audio] {stream_label}: requested min {desired_period} frames ({:.2} ms), granted {chosen_period} frames ({:.2} ms) @ {} Hz",
+            frames_to_ms(desired_period, format.sample_rate),
+            frames_to_ms(chosen_period, format.sample_rate),
+            format.sample_rate,
+        );
     }
 
     let event = LocalEvent::new()?;
@@ -581,6 +746,7 @@ fn try_open_audioclient3(
         buffer_frames,
         raw_mode,
         low_period_api: true,
+        periodicity_locked: false,
     })
 }
 
@@ -627,6 +793,7 @@ fn open_fallback_audioclient(device: &IMMDevice) -> Result<LowLatencyEndpoint, S
         buffer_frames,
         raw_mode: false,
         low_period_api: false,
+        periodicity_locked: false,
     })
 }
 
@@ -679,7 +846,7 @@ unsafe fn parse_waveformat(fmt_ptr: *const WAVEFORMATEX) -> Result<EndpointForma
     })
 }
 
-fn prime_silent(render: &IAudioRenderClient, frames: usize) -> Result<(), String> {
+pub(crate) fn prime_silent(render: &IAudioRenderClient, frames: usize) -> Result<(), String> {
     if frames == 0 {
         return Ok(());
     }
@@ -694,12 +861,13 @@ fn prime_silent(render: &IAudioRenderClient, frames: usize) -> Result<(), String
     Ok(())
 }
 
-fn drain_capture_packets(
+pub(crate) fn drain_capture_packets(
     capture: &IAudioCaptureClient,
     format: &EndpointFormat,
     resampler: &mut StreamingResampler,
     ring: &mut DryRing,
-) {
+) -> u64 {
+    let mut wrap_overruns = 0u64;
     loop {
         let Ok(packet_frames) = (unsafe { capture.GetNextPacketSize() }) else {
             break;
@@ -721,20 +889,22 @@ fn drain_capture_packets(
         let is_silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || buf_ptr.is_null();
         if is_silent {
             for _ in 0..count {
-                resampler.push(0.0, ring);
+                wrap_overruns = wrap_overruns.saturating_add(resampler.push(0.0, ring));
             }
         } else {
             let byte_len = count * format.block_align;
             let bytes = unsafe { slice::from_raw_parts(buf_ptr, byte_len) };
             for frame in bytes.chunks_exact(format.block_align) {
                 let mono = decode_frame_to_mono(frame, format);
-                resampler.push(mono, ring);
+                wrap_overruns = wrap_overruns.saturating_add(resampler.push(mono, ring));
             }
         }
         let _ = unsafe { capture.ReleaseBuffer(frames_read) };
     }
+    wrap_overruns
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_dry_frames(
     render: &IAudioRenderClient,
     frames: usize,
@@ -743,6 +913,7 @@ fn write_dry_frames(
     gain: &mut f32,
     target_gain: f32,
     last_sample: &mut f32,
+    underruns: &mut u64,
 ) -> Result<(), String> {
     if frames == 0 {
         return Ok(());
@@ -765,6 +936,7 @@ fn write_dry_frames(
                 s
             }
             None => {
+                *underruns = underruns.saturating_add(1);
                 *last_sample *= 0.985;
                 *last_sample
             }
@@ -776,7 +948,7 @@ fn write_dry_frames(
     unsafe { render.ReleaseBuffer(frames as u32, 0) }.map_err(|err| err.to_string())
 }
 
-fn decode_frame_to_mono(frame: &[u8], format: &EndpointFormat) -> f32 {
+pub(crate) fn decode_frame_to_mono(frame: &[u8], format: &EndpointFormat) -> f32 {
     let ch_count = format.channels.max(1);
     let mut sum = 0.0f32;
     let mut read_channels = 0usize;
@@ -829,7 +1001,7 @@ fn decode_frame_to_mono(frame: &[u8], format: &EndpointFormat) -> f32 {
     }
 }
 
-fn encode_mono_to_frame(sample: f32, frame: &mut [u8], format: &EndpointFormat) {
+pub(crate) fn encode_mono_to_frame(sample: f32, frame: &mut [u8], format: &EndpointFormat) {
     let clamped = sample.clamp(-1.0, 1.0);
     let step = match format.encoding {
         SampleEncoding::Float32 | SampleEncoding::Pcm32 => 4,
@@ -867,7 +1039,7 @@ fn encode_mono_to_frame(sample: f32, frame: &mut [u8], format: &EndpointFormat) 
     }
 }
 
-struct DryRing {
+pub(crate) struct DryRing {
     buf: Box<[f32; DRY_RING_CAPACITY]>,
     read: usize,
     write: usize,
@@ -875,7 +1047,7 @@ struct DryRing {
 }
 
 impl DryRing {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: Box::new([0.0; DRY_RING_CAPACITY]),
             read: 0,
@@ -884,27 +1056,24 @@ impl DryRing {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    fn clear(&mut self) {
-        self.read = 0;
-        self.write = 0;
-        self.len = 0;
-    }
-
-    fn push(&mut self, sample: f32) {
+    /// Pushes one sample without allocating; returns `true` if capacity wrapped and dropped the oldest sample.
+    pub(crate) fn push(&mut self, sample: f32) -> bool {
         self.buf[self.write] = sample;
         self.write = (self.write + 1) & (DRY_RING_CAPACITY - 1);
         if self.len == DRY_RING_CAPACITY {
             self.read = (self.read + 1) & (DRY_RING_CAPACITY - 1);
+            true
         } else {
             self.len += 1;
+            false
         }
     }
 
-    fn pop(&mut self) -> Option<f32> {
+    pub(crate) fn pop(&mut self) -> Option<f32> {
         if self.len == 0 {
             return None;
         }
@@ -914,7 +1083,7 @@ impl DryRing {
         Some(sample)
     }
 
-    fn trim_to(&mut self, keep_latest: usize) {
+    pub(crate) fn trim_to(&mut self, keep_latest: usize) {
         if self.len > keep_latest {
             let drop_count = self.len - keep_latest;
             self.read = (self.read + drop_count) & (DRY_RING_CAPACITY - 1);
@@ -923,7 +1092,7 @@ impl DryRing {
     }
 }
 
-struct StreamingResampler {
+pub(crate) struct StreamingResampler {
     passthrough: bool,
     step_in_per_out: f64,
     pos: f64,
@@ -932,7 +1101,7 @@ struct StreamingResampler {
 }
 
 impl StreamingResampler {
-    fn new(in_rate: u32, out_rate: u32) -> Self {
+    pub(crate) fn new(in_rate: u32, out_rate: u32) -> Self {
         let in_r = in_rate.max(1);
         let out_r = out_rate.max(1);
         Self {
@@ -944,26 +1113,27 @@ impl StreamingResampler {
         }
     }
 
-    fn push(&mut self, input: f32, ring: &mut DryRing) {
+    pub(crate) fn push(&mut self, input: f32, ring: &mut DryRing) -> u64 {
         if self.passthrough {
-            ring.push(input);
-            return;
+            return u64::from(ring.push(input));
         }
         if !self.initialized {
             self.prev = input;
             self.initialized = true;
-            ring.push(input);
+            let over = u64::from(ring.push(input));
             self.pos = self.step_in_per_out;
-            return;
+            return over;
         }
+        let mut overruns = 0u64;
         while self.pos <= 1.0 {
             let frac = self.pos as f32;
             let interp = self.prev + (input - self.prev) * frac;
-            ring.push(interp);
+            overruns += u64::from(ring.push(interp));
             self.pos += self.step_in_per_out;
         }
         self.pos -= 1.0;
         self.prev = input;
+        overruns
     }
 }
 
@@ -975,9 +1145,13 @@ mod tests {
     #[test]
     fn dry_ring_wraps_and_trims_oldest_without_allocating() {
         let mut ring = DryRing::new();
+        let mut wrapped = 0usize;
         for i in 0..(DRY_RING_CAPACITY + 10) {
-            ring.push(i as f32);
+            if ring.push(i as f32) {
+                wrapped += 1;
+            }
         }
+        assert_eq!(wrapped, 10);
         assert_eq!(ring.len(), DRY_RING_CAPACITY);
         assert_eq!(ring.pop(), Some(10.0));
 
@@ -1046,13 +1220,14 @@ mod tests {
         let Ok((cap_wdev, _)) = pick_capture_device(&enumerator) else {
             return;
         };
+        let default_out_name = out_wdev.get_friendlyname().unwrap_or_default();
         if let (Ok(cap_c), Ok(out_c)) = (cap_wdev.get_iaudioclient(), out_wdev.get_iaudioclient())
         {
             println!(
-                "[LATENCY] driver_periods_hns: cap={:?} out={:?} out_name={:?}",
+                "[LATENCY] driver_periods_hns: cap={:?} out={:?} default_out_name={:?}",
                 cap_c.get_device_period().ok(),
                 out_c.get_device_period().ok(),
-                out_wdev.get_friendlyname().ok()
+                default_out_name
             );
         }
 
@@ -1077,9 +1252,10 @@ mod tests {
 
         let wet_render_us = shared.latency_us.load(Ordering::Relaxed);
         let wet_rate = shared.sample_rate.load(Ordering::Relaxed);
-        let metrics = engine.dry_monitor_metrics().cloned();
+        let metrics = engine.dry_monitor_metrics();
         println!(
-            "[LATENCY] dry_metrics={metrics:?}\n[LATENCY] dry_monitor_samples_us={dry_samples_us:?} wet_render_us={wet_render_us} wet_rate={wet_rate} status={:?}",
+            "[LATENCY] metrics={metrics:?}\n[LATENCY] summary={}\n[LATENCY] dry_monitor_samples_us={dry_samples_us:?} wet_render_us={wet_render_us} wet_rate={wet_rate} status={:?}",
+            metrics.as_ref().map(|m| m.summary()).unwrap_or_default(),
             shared.status.lock().ok().map(|s| s.clone())
         );
 
@@ -1087,6 +1263,18 @@ mod tests {
             !dry_samples_us.is_empty(),
             "Dry monitor should publish non-zero live latency measurements when enabled"
         );
+        if let Some(ref m) = metrics {
+            assert!(
+                m.wet_max_ring_frames > 0 && m.dry_max_ring_frames > 0,
+                "Both wet and dry rings must publish non-zero max_ring_frames guards"
+            );
+            assert!(
+                !m.wet_target_name.contains(&default_out_name) || default_out_name.is_empty(),
+                "Wet output target ({}) must never be the default monitor endpoint ({})",
+                m.wet_target_name,
+                default_out_name
+            );
+        }
         engine.stop();
     }
 }

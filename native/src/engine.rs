@@ -1,21 +1,25 @@
-use std::collections::VecDeque;
+use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use rtrb::{Consumer, Producer, RingBuffer};
-use wasapi::{
-    Direction, DeviceEnumerator, SampleType, StreamMode, WaveFormat, initialize_mta,
+use wasapi::{initialize_mta, DeviceEnumerator, Direction};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::Media::Audio::{
+    IAudioCaptureClient, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::System::Threading::WaitForMultipleObjects;
+use windows_core::HSTRING;
 
-use crate::dry_monitor::{DryMonitor, DryMonitorMetrics};
+use crate::dry_monitor::{
+    drain_capture_packets, encode_mono_to_frame, frames_to_ms, open_low_latency_endpoint,
+    prime_silent, DryMonitor, DryMonitorMetrics, DryRing, EndpointFormat, LowLatencyEndpoint,
+    MmcssGuard, StopEvent, StreamingResampler,
+};
 use crate::dsp::VoiceChain;
 use crate::state::{load_f32, Shared};
-
-const RING_FRAMES: usize = 1024;
-const CABLE_RING_FRAMES: usize = 4096;
-const TARGET_RATE: usize = 48_000;
 
 #[derive(Clone)]
 pub struct PlaybackDevice {
@@ -50,7 +54,11 @@ pub fn list_playback_devices() -> Vec<PlaybackDevice> {
             looks_virtual,
         });
     }
-    devices.sort_by(|a, b| b.looks_virtual.cmp(&a.looks_virtual).then(a.name.cmp(&b.name)));
+    devices.sort_by(|a, b| {
+        b.looks_virtual
+            .cmp(&a.looks_virtual)
+            .then(a.name.cmp(&b.name))
+    });
     devices
 }
 
@@ -62,6 +70,10 @@ pub fn is_virtual_cable_name(name: &str) -> bool {
         || lower.contains("virtual cable")
         || lower.contains("virtual audio")
         || lower.contains("line 1")
+}
+
+pub fn is_virtual_mic_render_name(name: &str) -> bool {
+    is_virtual_cable_name(name) || name.to_ascii_lowercase().contains("streaming microphone")
 }
 
 pub fn is_stereo_mix_name(name: &str) -> bool {
@@ -92,154 +104,182 @@ pub fn stereo_mix_device_name() -> Option<String> {
     None
 }
 
+pub(crate) fn adapter_key(interface_name: &str, friendly_name: &str) -> String {
+    let trimmed = interface_name.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_ascii_lowercase();
+    }
+    if let (Some(open), Some(close)) = (friendly_name.find('('), friendly_name.rfind(')')) {
+        if open + 1 < close {
+            return friendly_name[open + 1..close].trim().to_ascii_lowercase();
+        }
+    }
+    String::new()
+}
+
+#[derive(Clone, Debug)]
+struct WetStaticMetrics {
+    target_name: String,
+    rate: u32,
+    period_frames: u32,
+    min_period_frames: u32,
+    buffer_frames: u32,
+    low_period_api: bool,
+    periodicity_locked: bool,
+}
+
 pub struct Engine {
+    shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+    wet_stop_signal: Arc<StopEvent>,
+    wet_thread: Option<JoinHandle<()>>,
+    wet_static: WetStaticMetrics,
     dry_monitor: Option<DryMonitor>,
 }
 
 impl Engine {
     pub fn start(shared: Arc<Shared>) -> Result<Self, String> {
         let _ = initialize_mta();
-        shared.sample_rate.store(0, Ordering::Relaxed);
-        shared.output_ready.store(false, Ordering::Relaxed);
-        let dry_monitor = DryMonitor::start(Arc::clone(&shared)).ok();
+        shared.reset_stream_metrics();
+
+        let dry_monitor = match DryMonitor::start(Arc::clone(&shared)) {
+            Ok(dm) => Some(dm),
+            Err(err) => {
+                eprintln!("[audio] dry-monitor failed to start: {err}");
+                None
+            }
+        };
+
         let stop = Arc::new(AtomicBool::new(false));
-        let send_discord = shared.send_discord.load(Ordering::Relaxed);
+        let wet_stop_signal = Arc::new(StopEvent::new()?);
         let discord_device = shared
             .discord_device
             .lock()
             .ok()
             .map(|id| id.clone())
             .unwrap_or_default();
-        let (producer, consumer) = RingBuffer::<f32>::new(RING_FRAMES);
-        let mut cable_pair = None;
-        if send_discord && !discord_device.is_empty() {
-            cable_pair = Some(RingBuffer::<f32>::new(CABLE_RING_FRAMES));
-        }
 
-        let cap_shared = Arc::clone(&shared);
-        let cap_stop = Arc::clone(&stop);
-        let capture = thread::Builder::new()
-            .name("karaoke-cap".into())
+        let (init_tx, init_rx) = mpsc::sync_channel::<Result<WetStaticMetrics, String>>(1);
+        let wet_shared = Arc::clone(&shared);
+        let wet_stop = Arc::clone(&stop);
+        let wet_signal = Arc::clone(&wet_stop_signal);
+
+        let wet_handle = thread::Builder::new()
+            .name("karaoke-wet".into())
             .spawn(move || {
                 let _ = initialize_mta();
-                if let Err(err) = capture_thread(producer, cap_stop, cap_shared.clone()) {
-                    cap_shared.set_status(format!("Mic error: {err}"));
-                    cap_shared.live.store(false, Ordering::Relaxed);
+                if let Err(err) =
+                    run_wet_pipeline(wet_shared.clone(), wet_stop, wet_signal, discord_device, init_tx)
+                {
+                    wet_shared.set_status(format!("Wet pipeline error: {err}"));
+                    wet_shared.live.store(false, Ordering::Relaxed);
                 }
             })
             .map_err(|err| err.to_string())?;
 
-        let out_shared = Arc::clone(&shared);
-        let out_stop = Arc::clone(&stop);
-        let (cable_out, cable_cons) = match cable_pair {
-            Some((prod, cons)) => (Some(prod), Some(cons)),
-            None => (None, None),
+        let wet_static = match init_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(info)) => info,
+            Ok(Err(err)) => {
+                stop.store(true, Ordering::Relaxed);
+                wet_stop_signal.signal();
+                let _ = wet_handle.join();
+                if let Some(dry) = dry_monitor {
+                    dry.stop();
+                }
+                return Err(err);
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Relaxed);
+                wet_stop_signal.signal();
+                let _ = wet_handle.join();
+                if let Some(dry) = dry_monitor {
+                    dry.stop();
+                }
+                return Err("Wet pipeline initialization timed out".into());
+            }
         };
-        let render = thread::Builder::new()
-            .name("karaoke-out".into())
-            .spawn(move || {
-                let _ = initialize_mta();
-                if let Err(err) = render_thread(
-                    consumer,
-                    cable_out,
-                    out_stop,
-                    out_shared.clone(),
-                    false,
-                ) {
-                    out_shared.set_status(format!("Output error: {err}"));
-                    out_shared.live.store(false, Ordering::Relaxed);
-                }
-            })
-            .map_err(|err| err.to_string())?;
-
-        let mut threads = vec![capture, render];
-        if let Some(cable_cons) = cable_cons {
-            let cable_shared = Arc::clone(&shared);
-            let cable_stop = Arc::clone(&stop);
-            let cable = thread::Builder::new()
-                .name("karaoke-discord".into())
-                .spawn(move || {
-                    let _ = initialize_mta();
-                    if let Err(err) =
-                        cable_thread(cable_cons, cable_stop, cable_shared.clone(), discord_device)
-                    {
-                        cable_shared.set_status(format!("Discord cable: {err}"));
-                    }
-                })
-                .map_err(|err| err.to_string())?;
-            threads.push(cable);
-        }
 
         Ok(Self {
+            shared,
             stop,
-            threads,
+            wet_stop_signal,
+            wet_thread: Some(wet_handle),
+            wet_static,
             dry_monitor,
         })
     }
 
-    pub fn dry_monitor_metrics(&self) -> Option<&DryMonitorMetrics> {
-        self.dry_monitor.as_ref().map(DryMonitor::metrics)
+    pub fn dry_monitor_metrics(&self) -> Option<DryMonitorMetrics> {
+        let mut m = if let Some(ref dry) = self.dry_monitor {
+            dry.base_metrics().clone()
+        } else {
+            DryMonitorMetrics {
+                mic_name: String::new(),
+                capture_rate: 0,
+                capture_period_frames: 0,
+                capture_min_period_frames: 0,
+                capture_default_period_frames: 0,
+                capture_buffer_frames: 0,
+                capture_raw_mode: false,
+                capture_low_period_api: false,
+                capture_periodicity_locked: false,
+                render_rate: 0,
+                render_period_frames: 0,
+                render_min_period_frames: 0,
+                render_default_period_frames: 0,
+                render_buffer_frames: 0,
+                render_low_period_api: false,
+                render_periodicity_locked: false,
+                initial_latency_us: 0,
+                dry_ring_fill_frames: 0,
+                dry_max_ring_frames: 0,
+                dry_underruns: 0,
+                dry_overruns: 0,
+                wet_target_name: String::new(),
+                wet_rate: 0,
+                wet_period_frames: 0,
+                wet_min_period_frames: 0,
+                wet_buffer_frames: 0,
+                wet_low_period_api: false,
+                wet_periodicity_locked: false,
+                wet_ring_fill_frames: 0,
+                wet_max_ring_frames: 0,
+                wet_underruns: 0,
+                wet_overruns: 0,
+            }
+        };
+
+        m.dry_ring_fill_frames = self.shared.dry_ring_fill_frames.load(Ordering::Relaxed);
+        m.dry_max_ring_frames = self.shared.dry_max_ring_frames.load(Ordering::Relaxed);
+        m.dry_underruns = self.shared.dry_underruns.load(Ordering::Relaxed);
+        m.dry_overruns = self.shared.dry_overruns.load(Ordering::Relaxed);
+
+        m.wet_target_name = self.wet_static.target_name.clone();
+        m.wet_rate = self.wet_static.rate;
+        m.wet_period_frames = self.wet_static.period_frames;
+        m.wet_min_period_frames = self.wet_static.min_period_frames;
+        m.wet_buffer_frames = self.wet_static.buffer_frames;
+        m.wet_low_period_api = self.wet_static.low_period_api;
+        m.wet_periodicity_locked = self.wet_static.periodicity_locked;
+        m.wet_ring_fill_frames = self.shared.wet_ring_fill_frames.load(Ordering::Relaxed);
+        m.wet_max_ring_frames = self.shared.wet_max_ring_frames.load(Ordering::Relaxed);
+        m.wet_underruns = self.shared.wet_underruns.load(Ordering::Relaxed);
+        m.wet_overruns = self.shared.wet_overruns.load(Ordering::Relaxed);
+
+        Some(m)
     }
 
-    pub fn stop(self) {
+    pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(dry) = self.dry_monitor {
+        self.wet_stop_signal.signal();
+        if let Some(dry) = self.dry_monitor.take() {
             dry.stop();
         }
-        for handle in self.threads {
+        if let Some(handle) = self.wet_thread.take() {
             let _ = handle.join();
         }
+        self.shared.reclaim_old_tracks();
     }
-}
-
-struct ClientInfo {
-    exclusive: bool,
-    float: bool,
-    channels: usize,
-    sample_rate: u32,
-    block_align: usize,
-}
-
-fn open_client(
-    direction: Direction,
-    channels: usize,
-    prefer_exclusive: bool,
-) -> Result<(wasapi::AudioClient, wasapi::Handle, ClientInfo), String> {
-    let enumerator = DeviceEnumerator::new().map_err(|err| err.to_string())?;
-    let device = enumerator
-        .get_default_device(&direction)
-        .map_err(|err| err.to_string())?;
-    let desired = WaveFormat::new(32, 32, &SampleType::Float, TARGET_RATE as usize, channels, None);
-
-    if prefer_exclusive {
-        if let Ok(opened) = try_exclusive(&device, &direction, &desired) {
-            return Ok(opened);
-        }
-    }
-
-    let mut client = device.get_iaudioclient().map_err(|err| err.to_string())?;
-    let (_def, min_time) = client.get_device_period().map_err(|err| err.to_string())?;
-    let mode = StreamMode::EventsShared {
-        autoconvert: true,
-        buffer_duration_hns: min_time,
-    };
-    client
-        .initialize_client(&desired, &direction, &mode)
-        .map_err(|err| err.to_string())?;
-    let event = client.set_get_eventhandle().map_err(|err| err.to_string())?;
-    Ok((
-        client,
-        event,
-        ClientInfo {
-            exclusive: false,
-            float: true,
-            channels,
-            sample_rate: TARGET_RATE as u32,
-            block_align: desired.get_blockalign() as usize,
-        },
-    ))
 }
 
 pub(crate) fn pick_capture_device(
@@ -274,370 +314,616 @@ pub(crate) fn pick_capture_device(
     )
 }
 
-fn open_shared_capture(sample_rate: usize) -> Result<(wasapi::AudioClient, wasapi::Handle, ClientInfo, String), String> {
-    let enumerator = DeviceEnumerator::new().map_err(|err| err.to_string())?;
-    let (device, name) = pick_capture_device(&enumerator)?;
-    let desired = WaveFormat::new(32, 32, &SampleType::Float, sample_rate, 1, None);
-    let mut client = device.get_iaudioclient().map_err(|err| err.to_string())?;
-    let (_def, min_time) = client.get_device_period().map_err(|err| err.to_string())?;
-    let mode = StreamMode::EventsShared {
-        autoconvert: true,
-        buffer_duration_hns: min_time,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RenderEndpointCandidate {
+    pub id: String,
+    pub name: String,
+    pub interface_name: String,
+}
+
+/// Selects ordered non-default render endpoints for the wet (effected) signal so wet output
+/// NEVER shares `default_render_id` (`GetDefaultAudioEndpoint(eRender, eConsole)`) with the
+/// local dry monitor.
+///
+/// Priority:
+/// 1. User-selected `discord_device_id` (virtual cable), if non-empty and `!= default_render_id`.
+/// 2. Render endpoint on the same hardware audio adapter as `Stereo Mix`, if `!= default_render_id`
+///    (preferring digital/secondary buses on that adapter).
+/// 3. Any active virtual cable / virtual mic render endpoint (`!= default_render_id`).
+pub(crate) fn select_wet_candidates(
+    default_render_id: &str,
+    discord_device_id: &str,
+    stereo_mix_adapter_key: Option<&str>,
+    render_endpoints: &[RenderEndpointCandidate],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push_unique = |id: &str, label: String| {
+        if id != default_render_id && !out.iter().any(|(existing, _)| existing == id) {
+            out.push((id.to_string(), label));
+        }
     };
-    client
-        .initialize_client(&desired, &Direction::Capture, &mode)
+
+    if !discord_device_id.is_empty() && discord_device_id != default_render_id {
+        if let Some(ep) = render_endpoints.iter().find(|e| e.id == discord_device_id) {
+            push_unique(&ep.id, format!("{} [virtual cable]", ep.name));
+        } else {
+            push_unique(discord_device_id, "Discord virtual cable".to_string());
+        }
+    }
+
+    if let Some(sm_key) = stereo_mix_adapter_key.filter(|k| !k.is_empty()) {
+        let mut adapter_matches: Vec<&RenderEndpointCandidate> = render_endpoints
+            .iter()
+            .filter(|ep| {
+                ep.id != default_render_id
+                    && adapter_key(&ep.interface_name, &ep.name) == sm_key
+            })
+            .collect();
+        adapter_matches.sort_by_key(|ep| {
+            let lower = ep.name.to_ascii_lowercase();
+            if lower.contains("digital") || lower.contains("2nd") {
+                0usize
+            } else {
+                1usize
+            }
+        });
+        for ep in adapter_matches {
+            push_unique(&ep.id, format!("{} [Stereo Mix bus]", ep.name));
+        }
+    }
+
+    for ep in render_endpoints {
+        if ep.id != default_render_id && is_virtual_mic_render_name(&ep.name) {
+            push_unique(&ep.id, format!("{} [virtual cable]", ep.name));
+        }
+    }
+
+    out
+}
+
+fn discover_wet_candidates(
+    enumerator: &DeviceEnumerator,
+    discord_device_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let default_render = enumerator
+        .get_default_device(&Direction::Render)
         .map_err(|err| err.to_string())?;
-    let event = client.set_get_eventhandle().map_err(|err| err.to_string())?;
-    Ok((
-        client,
-        event,
-        ClientInfo {
-            exclusive: false,
-            float: true,
-            channels: 1,
-            sample_rate: sample_rate as u32,
-            block_align: desired.get_blockalign() as usize,
-        },
-        name,
+    let default_render_id = default_render.get_id().map_err(|err| err.to_string())?;
+
+    let mut stereo_mix_key: Option<String> = None;
+    if let Ok(cap_coll) = enumerator.get_device_collection(&Direction::Capture) {
+        let cap_count = cap_coll.get_nbr_devices().unwrap_or(0);
+        for index in 0..cap_count {
+            let Ok(dev) = cap_coll.get_device_at_index(index) else {
+                continue;
+            };
+            let Ok(name) = dev.get_friendlyname() else {
+                continue;
+            };
+            if is_stereo_mix_name(&name) {
+                let iface = dev.get_interface_friendlyname().unwrap_or_default();
+                let key = adapter_key(&iface, &name);
+                if !key.is_empty() {
+                    stereo_mix_key = Some(key);
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut render_endpoints = Vec::new();
+    if let Ok(ren_coll) = enumerator.get_device_collection(&Direction::Render) {
+        let ren_count = ren_coll.get_nbr_devices().unwrap_or(0);
+        for index in 0..ren_count {
+            let Ok(dev) = ren_coll.get_device_at_index(index) else {
+                continue;
+            };
+            let Ok(id) = dev.get_id() else {
+                continue;
+            };
+            let Ok(name) = dev.get_friendlyname() else {
+                continue;
+            };
+            let interface_name = dev.get_interface_friendlyname().unwrap_or_default();
+            render_endpoints.push(RenderEndpointCandidate {
+                id,
+                name,
+                interface_name,
+            });
+        }
+    }
+
+    Ok(select_wet_candidates(
+        &default_render_id,
+        discord_device_id,
+        stereo_mix_key.as_deref(),
+        &render_endpoints,
     ))
 }
 
-fn try_exclusive(
-    device: &wasapi::Device,
-    direction: &Direction,
-    desired: &WaveFormat,
-) -> Result<(wasapi::AudioClient, wasapi::Handle, ClientInfo), String> {
-    let mut client = device.get_iaudioclient().map_err(|err| err.to_string())?;
-    let fmt = client
-        .is_supported_exclusive_with_quirks(desired)
-        .map_err(|err| err.to_string())?;
-    let bits = fmt.get_bitspersample();
-    if bits != 16 && bits != 32 {
-        return Err("exclusive format is not 16 or 32 bit".into());
-    }
-    let (_def, min_time) = client.get_device_period().map_err(|err| err.to_string())?;
-    let period = client
-        .calculate_aligned_period_near(min_time, Some(128), &fmt)
-        .unwrap_or(min_time);
-    let mode = StreamMode::EventsExclusive { period_hns: period };
-    client
-        .initialize_client(&fmt, direction, &mode)
-        .map_err(|err| err.to_string())?;
-    let event = client.set_get_eventhandle().map_err(|err| err.to_string())?;
-    Ok((
-        client,
-        event,
-        ClientInfo {
-            exclusive: true,
-            float: bits == 32,
-            channels: fmt.get_nchannels() as usize,
-            sample_rate: fmt.get_samplespersec(),
-            block_align: fmt.get_blockalign() as usize,
-        },
-    ))
+enum WetSink {
+    Endpoint {
+        out: LowLatencyEndpoint,
+        render_client: IAudioRenderClient,
+        label: String,
+    },
+    Headless,
 }
 
-fn wait_for_output(shared: &Shared, stop: &AtomicBool) -> Result<usize, String> {
-    for _ in 0..200 {
-        if stop.load(Ordering::Relaxed) {
-            return Err("stopped".into());
-        }
-        if shared.output_ready.load(Ordering::Relaxed) {
-            let rate = shared.sample_rate.load(Ordering::Relaxed);
-            if rate > 0 {
-                return Ok(rate as usize);
+fn run_wet_pipeline(
+    shared: Arc<Shared>,
+    stop: Arc<AtomicBool>,
+    stop_signal: Arc<StopEvent>,
+    discord_device_id: String,
+    init_tx: mpsc::SyncSender<Result<WetStaticMetrics, String>>,
+) -> Result<(), String> {
+    let _mmcss = MmcssGuard::elevate_pro_audio();
+
+    let opened = (|| -> Result<(LowLatencyEndpoint, IAudioCaptureClient, WetSink, String), String> {
+        let wasapi_enum = DeviceEnumerator::new().map_err(|err| err.to_string())?;
+        let (mic_dev, mic_name) = pick_capture_device(&wasapi_enum)?;
+        let mic_id = mic_dev.get_id().map_err(|err| err.to_string())?;
+        let candidates = discover_wet_candidates(&wasapi_enum, &discord_device_id)?;
+
+        let com_enum: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .map_err(|err| err.to_string())?;
+        let wide_mic_id = HSTRING::from(&mic_id);
+        let cap_device =
+            unsafe { com_enum.GetDevice(&wide_mic_id) }.map_err(|err| err.to_string())?;
+        let cap = open_low_latency_endpoint(&cap_device, "wet-capture", true)?;
+        let capture_client: IAudioCaptureClient =
+            unsafe { cap.client.GetService() }.map_err(|err| err.to_string())?;
+
+        let mut sink = WetSink::Headless;
+        for (cand_id, cand_label) in candidates {
+            let wide_id = HSTRING::from(&cand_id);
+            let Ok(out_dev) = (unsafe { com_enum.GetDevice(&wide_id) }) else {
+                continue;
+            };
+            match open_low_latency_endpoint(&out_dev, "wet-render", false) {
+                Ok(out) => match unsafe { out.client.GetService::<IAudioRenderClient>() } {
+                    Ok(render_client) => {
+                        sink = WetSink::Endpoint {
+                            out,
+                            render_client,
+                            label: cand_label,
+                        };
+                        break;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[audio] wet-render GetService failed on {cand_label}: {err}"
+                        );
+                    }
+                },
+                Err(err) => {
+                    eprintln!("[audio] wet-render open failed on {cand_label}: {err}");
+                }
             }
         }
-        thread::sleep(Duration::from_millis(10));
+
+        Ok((cap, capture_client, sink, mic_name))
+    })();
+
+    let (cap, capture_client, sink, mic_name) = match opened {
+        Ok(ready) => ready,
+        Err(err) => {
+            let _ = init_tx.send(Err(err.clone()));
+            return Err(err);
+        }
+    };
+
+    match sink {
+        WetSink::Endpoint {
+            out,
+            render_client,
+            label,
+        } => run_wet_with_endpoint(
+            shared,
+            stop,
+            stop_signal,
+            cap,
+            capture_client,
+            out,
+            render_client,
+            label,
+            mic_name,
+            init_tx,
+        ),
+        WetSink::Headless => run_wet_headless(
+            shared,
+            stop,
+            stop_signal,
+            cap,
+            capture_client,
+            mic_name,
+            init_tx,
+        ),
     }
-    Err("Output device did not start".into())
 }
 
-fn capture_thread(
-    mut producer: Producer<f32>,
-    stop: Arc<AtomicBool>,
+#[allow(clippy::too_many_arguments)]
+fn run_wet_with_endpoint(
     shared: Arc<Shared>,
-) -> Result<(), String> {
-    let rate = wait_for_output(&shared, &stop)?;
-    let (client, event, info, mic_name) = open_shared_capture(rate)?;
-    let capture = client
-        .get_audiocaptureclient()
-        .map_err(|err| err.to_string())?;
-    let mut queue = VecDeque::new();
-    client.start_stream().map_err(|err| err.to_string())?;
-    if let Ok(mut status) = shared.status.lock() {
-        if !status.is_empty() {
-            *status = format!("{status} · mic {mic_name}");
-        }
-    }
-
-    while !stop.load(Ordering::Relaxed) {
-        if event.wait_for_event(200).is_err() {
-            continue;
-        }
-        capture
-            .read_from_device_to_deque(&mut queue)
-            .map_err(|err| err.to_string())?;
-        while queue.len() >= info.block_align {
-            let mut frame = vec![0u8; info.block_align];
-            for byte in &mut frame {
-                *byte = queue.pop_front().unwrap_or(0);
-            }
-            let sample = frame_to_mono(&frame, info.channels, info.float);
-            let _ = producer.push(sample);
-        }
-    }
-    let _ = client.stop_stream();
-    let _ = shared;
-    Ok(())
-}
-
-fn render_thread(
-    mut consumer: Consumer<f32>,
-    mut cable: Option<Producer<f32>>,
     stop: Arc<AtomicBool>,
-    shared: Arc<Shared>,
-    prefer_exclusive: bool,
+    stop_signal: Arc<StopEvent>,
+    cap: LowLatencyEndpoint,
+    capture_client: IAudioCaptureClient,
+    out: LowLatencyEndpoint,
+    render_client: IAudioRenderClient,
+    target_label: String,
+    mic_name: String,
+    init_tx: mpsc::SyncSender<Result<WetStaticMetrics, String>>,
 ) -> Result<(), String> {
-    let (client, event, info) = open_client(Direction::Render, 2, prefer_exclusive)?;
-    let render = client
-        .get_audiorenderclient()
-        .map_err(|err| err.to_string())?;
-    let mut chain = VoiceChain::new(info.sample_rate as f32);
-    let mut rms_acc = 0.0;
+    let out_rate = out.format.sample_rate.max(1);
+    let cap_in_out_frames = ((cap.period_frames as u64 * out_rate as u64)
+        .div_ceil(cap.format.sample_rate.max(1) as u64)) as usize;
+    let out_period = out.period_frames.max(1) as usize;
+    let out_buffer = out.buffer_frames.max(1) as usize;
+    let prime_frames = out_period.min(out_buffer);
+    let max_ring_frames = (cap_in_out_frames + out_period * 2).max(out_period * 3);
+    let trim_target_frames = cap_in_out_frames.max(out_period);
+    let target_render_padding = out_period.min(out_buffer);
+
+    let mut chain = VoiceChain::new(out_rate as f32);
+    let mut ring = DryRing::new();
+    let mut resampler = StreamingResampler::new(cap.format.sample_rate, out_rate);
+    let mut wet_underruns = 0u64;
+    let mut wet_overruns = 0u64;
+    let mut last_raw = 0.0f32;
+    let mut rms_acc = 0.0f32;
     let mut rms_n = 0usize;
 
-    shared.exclusive.store(info.exclusive, Ordering::Relaxed);
-    shared
-        .sample_rate
-        .store(info.sample_rate, Ordering::Relaxed);
-    let period_frames = client.get_buffer_size().unwrap_or(128);
-    let latency_us = (period_frames.saturating_mul(2) * 1_000_000) / info.sample_rate.max(1);
-    shared.latency_us.store(latency_us, Ordering::Relaxed);
+    // Start capture first and keep one period in the ring as jitter cushion between async USB/cable clocks.
+    if let Err(err) = unsafe { cap.client.Start() }.map_err(|e| e.to_string()) {
+        let _ = init_tx.send(Err(err.clone()));
+        return Err(err);
+    }
+    let pre_handles = [stop_signal.raw(), cap.event.raw()];
+    let deadline = std::time::Instant::now() + Duration::from_millis(50);
+    while ring.len() < cap_in_out_frames && std::time::Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = unsafe { WaitForMultipleObjects(&pre_handles, false, 15) };
+        wet_overruns = wet_overruns.saturating_add(drain_capture_packets(
+            &capture_client,
+            &cap.format,
+            &mut resampler,
+            &mut ring,
+        ));
+    }
+    ring.trim_to(trim_target_frames);
 
-    let available = client
-        .get_available_space_in_frames()
-        .map_err(|err| err.to_string())? as usize;
-    write_silence(&render, available, &info)?;
-    client.start_stream().map_err(|err| err.to_string())?;
+    if let Err(err) = prime_silent(&render_client, prime_frames) {
+        unsafe {
+            let _ = cap.client.Stop();
+        }
+        let _ = init_tx.send(Err(err.clone()));
+        return Err(err);
+    }
+
+    if let Err(err) = unsafe { out.client.Start() }.map_err(|e| e.to_string()) {
+        unsafe {
+            let _ = cap.client.Stop();
+        }
+        let _ = init_tx.send(Err(err.clone()));
+        return Err(err);
+    }
+
+    let initial_frames = (cap_in_out_frames + ring.len() + prime_frames) as u64;
+    let initial_latency_us = ((initial_frames * 1_000_000) / out_rate as u64) as u32;
+
+    shared.exclusive.store(false, Ordering::Relaxed);
+    shared.sample_rate.store(out_rate, Ordering::Relaxed);
+    shared
+        .latency_us
+        .store(initial_latency_us, Ordering::Relaxed);
+    shared
+        .wet_max_ring_frames
+        .store(max_ring_frames as u32, Ordering::Relaxed);
+    shared
+        .wet_ring_fill_frames
+        .store(ring.len() as u32, Ordering::Relaxed);
+    shared.wet_underruns.store(wet_underruns, Ordering::Relaxed);
+    shared.wet_overruns.store(wet_overruns, Ordering::Relaxed);
     shared.output_ready.store(true, Ordering::Relaxed);
 
-    let mode = if info.exclusive {
-        "WASAPI exclusive"
-    } else {
-        "WASAPI shared (low period)"
-    };
-    let discord = if cable.is_some() {
-        " · sending to Discord cable"
+    let locked_note = if cap.periodicity_locked || out.periodicity_locked {
+        " (period locked)"
     } else {
         ""
     };
     shared.set_status(format!(
-        "{mode} · {} Hz · ~{:.1} ms{discord}",
-        info.sample_rate,
-        latency_us as f32 / 1000.0
+        "wet -> {target_label} · {out_rate} Hz · ~{:.1} ms{locked_note} · mic {mic_name}",
+        frames_to_ms(initial_frames as u32, out_rate)
     ));
 
+    let static_metrics = WetStaticMetrics {
+        target_name: target_label,
+        rate: out_rate,
+        period_frames: out.period_frames,
+        min_period_frames: out.min_period_frames,
+        buffer_frames: out.buffer_frames,
+        low_period_api: out.low_period_api,
+        periodicity_locked: cap.periodicity_locked || out.periodicity_locked,
+    };
+    let _ = init_tx.send(Ok(static_metrics));
+
+    let wait_handles = [stop_signal.raw(), cap.event.raw(), out.event.raw()];
+
+    // Real-time audio callback loop: zero allocations, locks, logging, or blocking operations.
     while !stop.load(Ordering::Relaxed) {
-        if event.wait_for_event(200).is_err() {
+        let wait = unsafe { WaitForMultipleObjects(&wait_handles, false, 50) };
+        if stop.load(Ordering::Relaxed) || wait == WAIT_OBJECT_0 {
+            break;
+        }
+
+        let cap_overruns =
+            drain_capture_packets(&capture_client, &cap.format, &mut resampler, &mut ring);
+        if cap_overruns > 0 {
+            wet_overruns = wet_overruns.saturating_add(cap_overruns);
+            shared.wet_overruns.store(wet_overruns, Ordering::Relaxed);
+        }
+        if ring.len() > max_ring_frames {
+            ring.trim_to(trim_target_frames);
+            wet_overruns = wet_overruns.saturating_add(1);
+            shared.wet_overruns.store(wet_overruns, Ordering::Relaxed);
+        }
+
+        let Ok(padding_u32) = (unsafe { out.client.GetCurrentPadding() }) else {
+            break;
+        };
+        let padding = padding_u32 as usize;
+        let available = out_buffer.saturating_sub(padding);
+        let to_write = target_render_padding
+            .saturating_sub(padding)
+            .min(available);
+        if to_write == 0 {
+            shared
+                .wet_ring_fill_frames
+                .store(ring.len() as u32, Ordering::Relaxed);
             continue;
         }
-        let frames = client
-            .get_available_space_in_frames()
-            .map_err(|err| err.to_string())? as usize;
-        if frames == 0 {
-            continue;
+
+        let prev_underruns = wet_underruns;
+        if write_wet_frames(
+            &render_client,
+            to_write,
+            &out.format,
+            &mut ring,
+            &mut chain,
+            &shared,
+            &mut last_raw,
+            &mut wet_underruns,
+            &mut rms_acc,
+            &mut rms_n,
+        )
+        .is_err()
+        {
+            break;
         }
+        if wet_underruns != prev_underruns {
+            shared.wet_underruns.store(wet_underruns, Ordering::Relaxed);
+        }
+
+        let ring_fill = ring.len();
+        shared
+            .wet_ring_fill_frames
+            .store(ring_fill as u32, Ordering::Relaxed);
+        let post_padding = padding + to_write;
+        let in_flight_frames = (cap_in_out_frames + ring_fill + post_padding) as u64;
+        let latency_us = ((in_flight_frames * 1_000_000) / out_rate as u64) as u32;
+        shared.latency_us.store(latency_us, Ordering::Relaxed);
+    }
+
+    shared.wet_ring_fill_frames.store(0, Ordering::Relaxed);
+    unsafe {
+        let _ = cap.client.Stop();
+        let _ = out.client.Stop();
+    }
+    Ok(())
+}
+
+fn run_wet_headless(
+    shared: Arc<Shared>,
+    stop: Arc<AtomicBool>,
+    stop_signal: Arc<StopEvent>,
+    cap: LowLatencyEndpoint,
+    capture_client: IAudioCaptureClient,
+    mic_name: String,
+    init_tx: mpsc::SyncSender<Result<WetStaticMetrics, String>>,
+) -> Result<(), String> {
+    let rate = cap.format.sample_rate.max(1);
+    let period = cap.period_frames.max(1) as usize;
+    let max_ring_frames = (period * 2).max(2);
+    let trim_target_frames = period;
+
+    let mut chain = VoiceChain::new(rate as f32);
+    let mut ring = DryRing::new();
+    let mut resampler = StreamingResampler::new(rate, rate);
+    let mut wet_overruns = 0u64;
+    let mut rms_acc = 0.0f32;
+    let mut rms_n = 0usize;
+
+    if let Err(err) = unsafe { cap.client.Start() }.map_err(|e| e.to_string()) {
+        let _ = init_tx.send(Err(err.clone()));
+        return Err(err);
+    }
+
+    let latency_us = ((period as u64 * 1_000_000) / rate as u64) as u32;
+    shared.exclusive.store(false, Ordering::Relaxed);
+    shared.sample_rate.store(rate, Ordering::Relaxed);
+    shared.latency_us.store(latency_us, Ordering::Relaxed);
+    shared
+        .wet_max_ring_frames
+        .store(max_ring_frames as u32, Ordering::Relaxed);
+    shared.output_ready.store(true, Ordering::Relaxed);
+    shared.set_status(format!(
+        "wet -> headless (no separate cable/Stereo Mix bus) · {rate} Hz · mic {mic_name}"
+    ));
+
+    let static_metrics = WetStaticMetrics {
+        target_name: "headless (no separate wet bus)".to_string(),
+        rate,
+        period_frames: cap.period_frames,
+        min_period_frames: cap.min_period_frames,
+        buffer_frames: cap.buffer_frames,
+        low_period_api: cap.low_period_api,
+        periodicity_locked: cap.periodicity_locked,
+    };
+    let _ = init_tx.send(Ok(static_metrics));
+
+    let wait_handles = [stop_signal.raw(), cap.event.raw()];
+    while !stop.load(Ordering::Relaxed) {
+        let wait = unsafe { WaitForMultipleObjects(&wait_handles, false, 50) };
+        if stop.load(Ordering::Relaxed) || wait == WAIT_OBJECT_0 {
+            break;
+        }
+
+        let cap_overruns =
+            drain_capture_packets(&capture_client, &cap.format, &mut resampler, &mut ring);
+        if cap_overruns > 0 {
+            wet_overruns = wet_overruns.saturating_add(cap_overruns);
+            shared.wet_overruns.store(wet_overruns, Ordering::Relaxed);
+        }
+        if ring.len() > max_ring_frames {
+            ring.trim_to(trim_target_frames);
+            wet_overruns = wet_overruns.saturating_add(1);
+            shared.wet_overruns.store(wet_overruns, Ordering::Relaxed);
+        }
+        shared
+            .wet_ring_fill_frames
+            .store(ring.len() as u32, Ordering::Relaxed);
+
         let params = shared.params();
-        let track_gain = load_f32(&shared.track_gain);
-        let playing = shared.track_playing.load(Ordering::Relaxed);
-        let track = shared.track.lock().ok().and_then(|g| g.clone());
-        let mut mono = vec![0.0f32; frames];
-        for sample in &mut mono {
-            let raw = consumer.pop().unwrap_or(0.0);
-            let (voice, pitch) = chain.process(raw, &params);
-            let mut mixed = voice;
-            if playing {
-                if let Some(ref track) = track {
-                    let frame = shared.track_frame.fetch_add(1, Ordering::Relaxed);
-                    if frame >= track.frame_count(info.sample_rate) {
+        while let Some(raw) = ring.pop() {
+            let (_voice, pitch) = chain.process(raw, &params);
+            if shared.track_playing.load(Ordering::Relaxed) {
+                if let Some(track) = shared.load_track() {
+                    let idx = shared.track_frame.fetch_add(1, Ordering::Relaxed);
+                    if idx >= track.frame_count(rate) {
                         shared.track_playing.store(false, Ordering::Relaxed);
                         shared.track_frame.store(0, Ordering::Relaxed);
-                    } else {
-                        mixed += track.sample_at(frame, info.sample_rate) * track_gain;
                     }
                 }
             }
-            *sample = mixed.clamp(-1.0, 1.0);
-            if let Some(ref mut cable) = cable {
-                let _ = cable.push(*sample);
-            }
-            rms_acc += raw * raw;
-            rms_n += 1;
-            if pitch.freq > 0.0 {
-                shared.freq.store(pitch.freq.to_bits(), Ordering::Relaxed);
-                shared
-                    .target_midi
-                    .store(pitch.target_midi.to_bits(), Ordering::Relaxed);
-            } else if rms_n > 64 {
-                shared.freq.store(0, Ordering::Relaxed);
-            }
+            update_pitch_and_rms(&shared, raw, pitch.freq, pitch.target_midi, &mut rms_acc, &mut rms_n);
         }
-        if rms_n >= 256 {
-            let rms = (rms_acc / rms_n as f32).sqrt();
-            shared.rms.store(rms.to_bits(), Ordering::Relaxed);
-            rms_acc = 0.0;
-            rms_n = 0;
-        }
-        let bytes = encode_frames(&mono, &info);
-        render
-            .write_to_device(frames, &bytes, None)
-            .map_err(|err| err.to_string())?;
     }
-    let _ = client.stop_stream();
+
+    shared.wet_ring_fill_frames.store(0, Ordering::Relaxed);
+    unsafe {
+        let _ = cap.client.Stop();
+    }
     Ok(())
 }
 
-fn open_shared_by_id(
-    device_id: &str,
-    sample_rate: usize,
-) -> Result<(wasapi::AudioClient, wasapi::Handle, ClientInfo), String> {
-    let enumerator = DeviceEnumerator::new().map_err(|err| err.to_string())?;
-    let device = enumerator.get_device(device_id).map_err(|err| err.to_string())?;
-    let desired = WaveFormat::new(32, 32, &SampleType::Float, sample_rate, 2, None);
-    let mut client = device.get_iaudioclient().map_err(|err| err.to_string())?;
-    let (_def, min_time) = client.get_device_period().map_err(|err| err.to_string())?;
-    let mode = StreamMode::EventsShared {
-        autoconvert: true,
-        buffer_duration_hns: min_time,
-    };
-    client
-        .initialize_client(&desired, &Direction::Render, &mode)
-        .map_err(|err| err.to_string())?;
-    let event = client.set_get_eventhandle().map_err(|err| err.to_string())?;
-    Ok((
-        client,
-        event,
-        ClientInfo {
-            exclusive: false,
-            float: true,
-            channels: 2,
-            sample_rate: sample_rate as u32,
-            block_align: desired.get_blockalign() as usize,
-        },
-    ))
-}
-
-fn cable_thread(
-    mut consumer: Consumer<f32>,
-    stop: Arc<AtomicBool>,
-    shared: Arc<Shared>,
-    device_id: String,
-) -> Result<(), String> {
-    let rate = wait_for_output(&shared, &stop)?;
-    let (client, event, info) = open_shared_by_id(&device_id, rate)?;
-    let render = client
-        .get_audiorenderclient()
-        .map_err(|err| err.to_string())?;
-    let available = client
-        .get_available_space_in_frames()
-        .map_err(|err| err.to_string())? as usize;
-    write_silence(&render, available, &info)?;
-    client.start_stream().map_err(|err| err.to_string())?;
-
-    while !stop.load(Ordering::Relaxed) {
-        if event.wait_for_event(200).is_err() {
-            continue;
-        }
-        let frames = client
-            .get_available_space_in_frames()
-            .map_err(|err| err.to_string())? as usize;
-        if frames == 0 {
-            continue;
-        }
-        let mut mono = vec![0.0f32; frames];
-        for sample in &mut mono {
-            *sample = consumer.pop().unwrap_or(0.0);
-        }
-        let bytes = encode_frames(&mono, &info);
-        render
-            .write_to_device(frames, &bytes, None)
-            .map_err(|err| err.to_string())?;
-    }
-    let _ = client.stop_stream();
-    Ok(())
-}
-
-fn write_silence(
-    render: &wasapi::AudioRenderClient,
+#[allow(clippy::too_many_arguments)]
+fn write_wet_frames(
+    render: &IAudioRenderClient,
     frames: usize,
-    info: &ClientInfo,
+    format: &EndpointFormat,
+    ring: &mut DryRing,
+    chain: &mut VoiceChain,
+    shared: &Shared,
+    last_raw: &mut f32,
+    underruns: &mut u64,
+    rms_acc: &mut f32,
+    rms_n: &mut usize,
 ) -> Result<(), String> {
-    let zeros = vec![0.0f32; frames];
-    let bytes = encode_frames(&zeros, info);
-    render
-        .write_to_device(frames, &bytes, None)
-        .map_err(|err| err.to_string())
+    if frames == 0 {
+        return Ok(());
+    }
+    let buf_ptr = unsafe { render.GetBuffer(frames as u32) }.map_err(|err| err.to_string())?;
+    let byte_len = frames * format.block_align;
+    let out_bytes = unsafe { slice::from_raw_parts_mut(buf_ptr, byte_len) };
+
+    let params = shared.params();
+    let track_gain = load_f32(&shared.track_gain);
+    let mut playing = shared.track_playing.load(Ordering::Relaxed);
+    let track_ref = shared.load_track();
+
+    for frame in out_bytes.chunks_exact_mut(format.block_align) {
+        let raw = pop_wet_sample(ring, last_raw, underruns);
+        let (voice, pitch) = chain.process(raw, &params);
+        let mut mixed = voice;
+        if playing {
+            if let Some(track) = track_ref {
+                let idx = shared.track_frame.fetch_add(1, Ordering::Relaxed);
+                if idx >= track.frame_count(format.sample_rate) {
+                    shared.track_playing.store(false, Ordering::Relaxed);
+                    shared.track_frame.store(0, Ordering::Relaxed);
+                    playing = false;
+                } else {
+                    mixed += track.sample_at(idx, format.sample_rate) * track_gain;
+                }
+            }
+        }
+        encode_mono_to_frame(mixed, frame, format);
+        update_pitch_and_rms(
+            shared,
+            raw,
+            pitch.freq,
+            pitch.target_midi,
+            rms_acc,
+            rms_n,
+        );
+    }
+
+    unsafe { render.ReleaseBuffer(frames as u32, 0) }.map_err(|err| err.to_string())
 }
 
-fn frame_to_mono(frame: &[u8], channels: usize, float: bool) -> f32 {
-    if frame.is_empty() || channels == 0 {
-        return 0.0;
-    }
-    if float {
-        let step = 4;
-        let mut sum = 0.0;
-        let mut count = 0usize;
-        for ch in 0..channels {
-            let start = ch * step;
-            if start + 4 <= frame.len() {
-                sum += f32::from_le_bytes([frame[start], frame[start + 1], frame[start + 2], frame[start + 3]]);
-                count += 1;
-            }
+#[inline]
+pub(crate) fn pop_wet_sample(ring: &mut DryRing, last_raw: &mut f32, underruns: &mut u64) -> f32 {
+    match ring.pop() {
+        Some(sample) => {
+            *last_raw = sample;
+            sample
         }
-        if count == 0 {
-            0.0
-        } else {
-            sum / count as f32
-        }
-    } else {
-        let step = 2;
-        let mut sum = 0.0;
-        let mut count = 0usize;
-        for ch in 0..channels {
-            let start = ch * step;
-            if start + 2 <= frame.len() {
-                let v = i16::from_le_bytes([frame[start], frame[start + 1]]);
-                sum += f32::from(v) / 32768.0;
-                count += 1;
-            }
-        }
-        if count == 0 {
-            0.0
-        } else {
-            sum / count as f32
+        None => {
+            *underruns = underruns.saturating_add(1);
+            *last_raw *= 0.985;
+            *last_raw
         }
     }
 }
 
-fn encode_frames(mono: &[f32], info: &ClientInfo) -> Vec<u8> {
-    let mut out = Vec::with_capacity(mono.len() * info.block_align);
-    for &sample in mono {
-        for _ in 0..info.channels {
-            if info.float {
-                out.extend_from_slice(&sample.to_le_bytes());
-            } else {
-                let v = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
+#[inline]
+fn update_pitch_and_rms(
+    shared: &Shared,
+    raw: f32,
+    freq: f32,
+    target_midi: f32,
+    rms_acc: &mut f32,
+    rms_n: &mut usize,
+) {
+    *rms_acc += raw * raw;
+    *rms_n += 1;
+    if freq > 0.0 {
+        shared.freq.store(freq.to_bits(), Ordering::Relaxed);
+        shared
+            .target_midi
+            .store(target_midi.to_bits(), Ordering::Relaxed);
+    } else if *rms_n > 64 {
+        shared.freq.store(0, Ordering::Relaxed);
     }
-    out
+    if *rms_n >= 256 {
+        let rms = (*rms_acc / *rms_n as f32).sqrt();
+        shared.rms.store(rms.to_bits(), Ordering::Relaxed);
+        *rms_acc = 0.0;
+        *rms_n = 0;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stereo_mix_name, is_virtual_cable_name};
+    use super::{
+        adapter_key, is_stereo_mix_name, is_virtual_cable_name, pop_wet_sample,
+        select_wet_candidates, RenderEndpointCandidate,
+    };
+    use crate::dry_monitor::DryRing;
 
     #[test]
     fn stereo_mix_is_not_a_microphone() {
@@ -652,5 +938,60 @@ mod tests {
     fn virtual_cable_names_stay_narrow() {
         assert!(is_virtual_cable_name("CABLE Input (VB-Audio Virtual Cable)"));
         assert!(!is_virtual_cable_name("Speakers (Realtek(R) Audio)"));
+    }
+
+    #[test]
+    fn wet_candidates_never_include_default_render_and_prefer_cable_then_stereo_mix_bus() {
+        let endpoints = vec![
+            RenderEndpointCandidate {
+                id: "dev-headphones".into(),
+                name: "HISENSE (NVIDIA High Definition Audio)".into(),
+                interface_name: "NVIDIA High Definition Audio".into(),
+            },
+            RenderEndpointCandidate {
+                id: "dev-realtek-spdif".into(),
+                name: "Realtek Digital Output (3- Realtek High Definition Audio)".into(),
+                interface_name: "Realtek High Definition Audio".into(),
+            },
+            RenderEndpointCandidate {
+                id: "dev-steam-mic".into(),
+                name: "Speakers (Steam Streaming Microphone)".into(),
+                interface_name: "Steam Streaming Microphone".into(),
+            },
+        ];
+
+        // When listening on HISENSE and Stereo Mix is on Realtek, wet picks Realtek Digital Output first.
+        let sm_key = adapter_key(
+            "Realtek High Definition Audio",
+            "Stereo Mix (3- Realtek High Definition Audio)",
+        );
+        let ordered = select_wet_candidates("dev-headphones", "", Some(&sm_key), &endpoints);
+        assert_eq!(ordered[0].0, "dev-realtek-spdif");
+        assert!(ordered.iter().all(|(id, _)| id != "dev-headphones"));
+
+        // When default render IS Realtek Digital Output, Stereo Mix shares the default endpoint,
+        // so wet splits onto the virtual mic cable and NEVER includes default_render_id.
+        let split = select_wet_candidates("dev-realtek-spdif", "", Some(&sm_key), &endpoints);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].0, "dev-steam-mic");
+        assert!(split.iter().all(|(id, _)| id != "dev-realtek-spdif"));
+    }
+
+    #[test]
+    fn wet_underrun_counts_and_decays_smoothly_without_zero_step() {
+        let mut ring = DryRing::new();
+        ring.push(0.8);
+        let mut last_raw = 0.0;
+        let mut underruns = 0u64;
+
+        let s0 = pop_wet_sample(&mut ring, &mut last_raw, &mut underruns);
+        assert!((s0 - 0.8).abs() < 1e-6);
+        assert_eq!(underruns, 0);
+
+        let s1 = pop_wet_sample(&mut ring, &mut last_raw, &mut underruns);
+        let s2 = pop_wet_sample(&mut ring, &mut last_raw, &mut underruns);
+        assert_eq!(underruns, 2);
+        assert!(s1 > 0.7 && s1 < 0.8, "expected decayed sample, got {s1}");
+        assert!(s2 > 0.7 && s2 < s1, "expected monotonic decay, got {s2}");
     }
 }
